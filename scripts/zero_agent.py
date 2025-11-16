@@ -34,6 +34,7 @@ import torch
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
+from isaaclab.envs import DirectMARLEnv
 
 import UavSwarm.tasks  # noqa: F401
 
@@ -47,17 +48,41 @@ def main():
     # create environment
     env = gym.make(args_cli.task, cfg=env_cfg)
 
+    # Check if it's a MARL environment
+    is_marl = isinstance(env.unwrapped, DirectMARLEnv)
+
     # print info (this is vectorized environment)
-    print(f"[INFO]: Gym observation space: {env.observation_space}")
-    print(f"[INFO]: Gym action space: {env.action_space}")
+    if is_marl:
+        print(f"[INFO]: MARL Environment detected")
+        print(f"[INFO]: Number of agents: {env.unwrapped.num_agents}")
+        print(f"[INFO]: Possible agents: {env.unwrapped.cfg.possible_agents}")
+        print(f"[INFO]: Action spaces: {env.unwrapped.cfg.action_spaces}")
+        print(f"[INFO]: Observation spaces: {env.unwrapped.cfg.observation_spaces}")
+    else:
+        print(f"[INFO]: Gym observation space: {env.observation_space}")
+        print(f"[INFO]: Gym action space: {env.action_space}")
+    
     # reset environment
     env.reset()
+    
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
-            # compute zero actions
-            actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
+            if is_marl:
+                # For MARL: actions must be a dictionary {agent_name: action_tensor}
+                # Each action tensor has shape (num_envs, action_dim)
+                num_envs = env.unwrapped.num_envs
+                action_dim = env.unwrapped.cfg.single_action_space
+                
+                actions = {
+                    agent: torch.zeros(num_envs, action_dim, device=env.unwrapped.device)
+                    for agent in env.unwrapped.cfg.possible_agents
+                }
+            else:
+                # For standard RL: actions shape from action_space
+                actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
+            
             # apply actions
             env.step(actions)
 
