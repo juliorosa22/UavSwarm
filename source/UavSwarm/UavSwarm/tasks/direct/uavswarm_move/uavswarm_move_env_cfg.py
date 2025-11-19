@@ -39,7 +39,7 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 
 
 @configclass
-class HoverUAVSwarmEnvCfg(DirectMARLEnvCfg):
+class MoveUAVSwarmEnvCfg(DirectMARLEnvCfg):
     """
     Direct MARL workflow for UAV Swarm with multiple Crazyflies per environment.
     """

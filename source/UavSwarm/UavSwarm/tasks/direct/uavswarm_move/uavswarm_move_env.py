@@ -14,7 +14,7 @@ from isaaclab.markers import VisualizationMarkers
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils.math import subtract_frame_transforms
 
-from .uavswarm_marl_env_cfg import HoverUAVSwarmEnvCfg
+from .uavswarm_move_env_cfg import MoveUAVSwarmEnvCfg
 
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 
@@ -41,7 +41,7 @@ Main idea of how use the Direct workflow when designing a task
 """
 
 
-class HoverUAVSwarmEnv(DirectMARLEnv):
+class MoveUAVSwarmEnv(DirectMARLEnv):
     """
     Direct-style MARL environment with N Crazyflies per env.
     - Actions: per-drone [thrust, mx, my, mz] ⇒ shape (num_agents, 4)
@@ -49,9 +49,9 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
     - Rewards: per-drone terms + swarm cohesion/collision penalties
     """
 
-    cfg: HoverUAVSwarmEnvCfg
+    cfg: MoveUAVSwarmEnvCfg
 
-    def __init__(self, cfg: HoverUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: MoveUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
         
         self.num_drones = cfg.num_agents        
         

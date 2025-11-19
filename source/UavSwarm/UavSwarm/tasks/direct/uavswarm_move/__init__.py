@@ -13,11 +13,11 @@ from . import agents
 
 
 gym.register(
-    id="Hover-UAVSwarm-Direct-v0",
-    entry_point=f"{__name__}.uavswarm_marl_env:HoverUAVSwarmEnv",
+    id="Move-UAVSwarm-Direct-v0",
+    entry_point=f"{__name__}.uavswarm_move_env:MoveUAVSwarmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.uavswarm_marl_env_cfg:HoverUAVSwarmEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.uavswarm_move_env_cfg:MoveUAVSwarmEnvCfg",
         "skrl_ippo_cfg_entry_point": f"{agents.__name__}:skrl_ippo_cfg.yaml",
         "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
     },
