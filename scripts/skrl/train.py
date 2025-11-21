@@ -197,9 +197,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
+    
+    # Debug: Print environment info BEFORE wrapping
+    print("\n[DEBUG] Environment info before wrapping:")
+    print(f"Environment type: {type(env.unwrapped)}")
+    print(f"Is DirectMARLEnv: {isinstance(env.unwrapped, DirectMARLEnv)}")
+    if isinstance(env.unwrapped, DirectMARLEnv):
+        print(f"Number of agents: {env.unwrapped.num_agents}")
+        print(f"Possible agents: {env.unwrapped.possible_agents}")
+        # Safely access observation/action spaces
+        if hasattr(env.unwrapped, 'observation_space'):
+            obs_space = env.unwrapped.observation_space
+            if isinstance(obs_space, dict):
+                print(f"Observation spaces: {list(obs_space.keys())}")
+            else:
+                print(f"Observation space type: {type(obs_space)}")
+        if hasattr(env.unwrapped, 'action_space'):
+            act_space = env.unwrapped.action_space
+            if isinstance(act_space, dict):
+                print(f"Action spaces: {list(act_space.keys())}")
+            else:
+                print(f"Action space type: {type(act_space)}")
+    print()
+    
+    # Reset environment to initialize buffers
+    print("[INFO] Resetting environment to initialize buffers...")
+    obs, info = env.reset()
+    print(f"[DEBUG] Initial observation type: {type(obs)}")
+    if isinstance(obs, dict):
+        print(f"[DEBUG] Observation keys: {list(obs.keys())}")
+        # Check first level keys
+        for key in list(obs.keys())[:3]:  # Print first 3 keys as sample
+            print(f"  - {key}: shape {obs[key].shape if hasattr(obs[key], 'shape') else type(obs[key])}")
+    print()
+    
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
+        print("[INFO] Converting multi-agent environment to single-agent instance for PPO.")
         env = multi_agent_to_single_agent(env)
 
     # wrap for video recording
@@ -215,7 +249,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for skrl
-    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
+    env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
+    
+    # Debug: Verify wrapper preserved multi-agent info
+    print("\n[DEBUG] Environment info after SkrlVecEnvWrapper:")
+    print(f"Wrapped env type: {type(env)}")
+    print(f"Has num_agents: {hasattr(env, 'num_agents')}")
+    if hasattr(env, 'num_agents'):
+        print(f"Number of agents: {env.num_agents}")
+    if hasattr(env, 'possible_agents'):
+        print(f"Possible agents: {env.possible_agents}")
+    if hasattr(env, 'observation_space'):
+        print(f"Observation space type: {type(env.observation_space)}")
+        if isinstance(env.observation_space, dict):
+            print(f"Observation space keys: {list(env.observation_space.keys())[:3]}")  # First 3 keys
+    if hasattr(env, 'action_space'):
+        print(f"Action space type: {type(env.action_space)}")
+        if isinstance(env.action_space, dict):
+            print(f"Action space keys: {list(env.action_space.keys())[:3]}")  # First 3 keys
+    print()
 
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html

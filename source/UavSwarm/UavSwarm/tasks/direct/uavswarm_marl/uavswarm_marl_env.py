@@ -16,7 +16,7 @@ from isaaclab.utils.math import subtract_frame_transforms
 
 from .uavswarm_marl_env_cfg import HoverUAVSwarmEnvCfg
 
-from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
+from isaaclab.markers import SPHERE_MARKER_CFG  # isort: skip
 
 #check out https://isaac-sim.github.io/IsaacLab/main/source/tutorials/03_envs/create_direct_rl_env.html for more details on the functions implemented in DirectMARLEnv workflow
 """
@@ -96,10 +96,14 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
-        # Create N Crazyflies per environment with distinct prim paths
+        # Create N Crazyflies per environment with distinct prim paths and materials
         for i in range(self.num_drones):
             robot_cfg: ArticulationCfg = self.cfg.robot_template.replace(
                 prim_path=f"/World/envs/env_.*/Robot_{i}"
+            ).replace(
+                spawn=self.cfg.robot_template.spawn.replace(
+                    visual_material_path=f"/World/Looks/Crazyflie_{i}"  # Unique path per drone
+                )
             )
             robot = Articulation(robot_cfg)
             self.scene.articulations[f"robot_{i}"] = robot
@@ -147,14 +151,16 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
                 body_ids=self._body_ids[j]
             )
     # as in the link tutorial: For asymmetric policies, the dictionary should also include the key critic and the states buffer as the value.
+    
     def _get_observations(self) -> dict:
         """Get observations for each drone (12 dims per drone).
         
         Returns:
-            Dictionary with observations in the format expected by DirectMARLEnv.
-            For each agent, obs has shape (num_envs, obs_dim)
+            Dictionary mapping agent names directly to observations.
+            Format: {"robot_0": obs0, "robot_1": obs1, "robot_2": obs2}
         """
         obs_dict = {}
+        #obs_list = []
         
         for j, rob in enumerate(self._robots):
             agent_name = f"robot_{j}"
@@ -166,7 +172,7 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[:, j, :]
             )
             
-            # Concatenate observation components (matching copy_quadenv.py)
+            # Concatenate observation components
             obs_j = torch.cat(
                 [
                     rob.data.root_lin_vel_b,       # (num_envs, 3)
@@ -178,8 +184,47 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
             )  # -> (num_envs, 12)
             
             obs_dict[agent_name] = obs_j
+            #obs_list.append(obs_j)
         
-        return {"policy": obs_dict}
+        # Concatenate all observations for centralized critic (state)
+        #state = torch.cat(obs_list, dim=-1)  # (num_envs, num_agents * 12)
+        return obs_dict
+        #return {"policy": obs_dict, "critic": state}
+        
+    def _get_states(self) -> torch.Tensor:
+        """Get centralized state for MAPPO critic.
+        
+        Returns:
+            Concatenated observations from all agents for centralized critic.
+            Shape: (num_envs, num_agents * obs_dim) = (num_envs, 3 * 12) = (num_envs, 36)
+        """
+        state_list = []
+        
+        for j, rob in enumerate(self._robots):
+            # Transform desired position to body frame
+            desired_pos_b, _ = subtract_frame_transforms(
+                rob.data.root_pos_w, 
+                rob.data.root_quat_w, 
+                self._desired_pos_w[:, j, :]
+            )
+            
+            # Same observation components as individual observations
+            obs_j = torch.cat(
+                [
+                    rob.data.root_lin_vel_b,       # (num_envs, 3)
+                    rob.data.root_ang_vel_b,       # (num_envs, 3)
+                    rob.data.projected_gravity_b,  # (num_envs, 3)
+                    desired_pos_b,                 # (num_envs, 3)
+                ],
+                dim=-1,
+            )  # -> (num_envs, 12)
+            
+            state_list.append(obs_j)
+        
+        # Concatenate all agent observations into global state
+        state = torch.cat(state_list, dim=-1)  # (num_envs, num_agents * 12)
+        
+        return state
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         """Calculate rewards matching copy_quadenv.py logic + swarm terms.
@@ -269,7 +314,7 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
         return terminated_dict, time_out_dict
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset environments (matching copy_quadenv.py pattern)."""
+        """Reset environments with inverted V formation for hovering task."""
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robots[0]._ALL_INDICES
 
@@ -317,33 +362,105 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
 
         self._actions[env_ids] = 0.0
 
-        # Sample new goals and reset robot states
+        # Get environment origins
         env_origins = self._terrain.env_origins[env_ids]
-        x_step, y_slope = self.cfg.v_spacing_xy
+        num_reset_envs = len(env_ids)
+        
+        # Calculate inverted V formation positions
+        # Inverted V: apex at front (negative X), wings spread backward and outward
+        v_angle_rad = torch.deg2rad(torch.tensor(self.cfg.formation_v_angle_deg, device=self.device))
+        base_sep = self.cfg.formation_base_separation
+        
+        # Scale separation based on max_num_agents to ensure formation fits
+        # For max agents, we want to maintain minimum separation
+        scale_factor = max(1.0, self.cfg.min_sep / base_sep)
+        effective_sep = base_sep * scale_factor
+        
+        # Generate formation positions for each drone
+        formation_positions = torch.zeros(self.num_drones, 3, device=self.device)
+        
+        if self.num_drones == 1:
+            # Single drone: centered at origin
+            formation_positions[0] = torch.tensor([0.0, 0.0, 0.0], device=self.device)
+        else:
+            # Multiple drones: inverted V formation
+            # Apex drone (index 0) at the front (negative X)
+            apex_idx = 0
+            formation_positions[apex_idx, 0] = self.cfg.formation_apex_offset  # X position (front)
+            formation_positions[apex_idx, 1] = 0.0  # Y position (centered)
+            
+            # Distribute remaining drones on left and right wings
+            remaining_drones = self.num_drones - 1
+            left_wing_count = remaining_drones // 2
+            right_wing_count = remaining_drones - left_wing_count
+            
+            # Left wing (negative Y)
+            for i in range(left_wing_count):
+                wing_idx = i + 1
+                x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
+                y_offset = -(i + 1) * effective_sep * torch.sin(v_angle_rad)  # Left
+                formation_positions[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
+                formation_positions[wing_idx, 1] = y_offset
+            
+            # Right wing (positive Y)
+            for i in range(right_wing_count):
+                wing_idx = left_wing_count + i + 1
+                x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
+                y_offset = (i + 1) * effective_sep * torch.sin(v_angle_rad)  # Right
+                formation_positions[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
+                formation_positions[wing_idx, 1] = y_offset
+        
+        # Verify minimum separation constraint
+        if self.num_drones > 1:
+            dists = torch.cdist(formation_positions.unsqueeze(0), formation_positions.unsqueeze(0)).squeeze(0)
+            # Set diagonal to large value to ignore self-distances
+            dists = dists + torch.eye(self.num_drones, device=self.device) * 1000.0
+            min_dist = dists.min()
+            
+            # If constraint violated, scale up the formation
+            if min_dist < self.cfg.min_sep:
+                scale_up = self.cfg.min_sep / min_dist
+                formation_positions[:, :2] *= scale_up
 
+        # Sample random spawn heights for each environment
+        spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
+            self.cfg.spawn_height_range[0], 
+            self.cfg.spawn_height_range[1]
+        )
+
+        # Reset each robot with formation-based positions
         for j, rob in enumerate(self._robots):
-            # Sample goal positions (matching copy_quadenv.py)
-            self._desired_pos_w[env_ids, j, :2] = torch.zeros_like(
-                self._desired_pos_w[env_ids, j, :2]
-            ).uniform_(-self.cfg.goal_xy_range, self.cfg.goal_xy_range)
-            self._desired_pos_w[env_ids, j, :2] += env_origins[:, :2]
-            self._desired_pos_w[env_ids, j, 2] = torch.zeros_like(
-                self._desired_pos_w[env_ids, j, 2]
-            ).uniform_(0.5, 1.5)
-
-            # Reset robot state with V-formation
+            # Get formation offset for this drone
+            formation_offset = formation_positions[j]  # (3,)
+            
+            # Expand to batch dimension
+            formation_offset_batch = formation_offset.unsqueeze(0).expand(num_reset_envs, -1)  # (num_reset_envs, 3)
+            
+            # Reset robot state with formation offset
             joint_pos = rob.data.default_joint_pos[env_ids]
             joint_vel = rob.data.default_joint_vel[env_ids]
-            default_root_state = rob.data.default_root_state[env_ids]
-            default_root_state[:, :3] += env_origins
+            default_root_state = rob.data.default_root_state[env_ids].clone()
             
-            # V-formation offset
-            default_root_state[:, 0] += j * x_step
-            default_root_state[:, 1] += (j - self.num_drones / 2.0) * y_slope
+            # Set position: env_origin + formation_offset + spawn_height
+            default_root_state[:, :2] = env_origins[:, :2] + formation_offset_batch[:, :2]
+            default_root_state[:, 2] = spawn_heights + formation_offset_batch[:, 2]
             
+            # Write to simulation
             rob.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
             rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
             rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+            
+            # Set goal position for hovering task:
+            # Goal = spawn position + vertical offset + small XY noise
+            self._desired_pos_w[env_ids, j, :2] = default_root_state[:, :2] + torch.zeros_like(
+                default_root_state[:, :2]
+            ).uniform_(-self.cfg.goal_xy_noise, self.cfg.goal_xy_noise)
+            
+            self._desired_pos_w[env_ids, j, 2] = (
+                spawn_heights + 
+                formation_offset_batch[:, 2] + 
+                self.cfg.hover_height_offset
+            )
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Enable/disable debug visualization (matching copy_quadenv.py)."""
@@ -351,8 +468,10 @@ class HoverUAVSwarmEnv(DirectMARLEnv):
             if not hasattr(self, "goal_pos_visualizers"):
                 self.goal_pos_visualizers = []
                 for i in range(self.num_drones):
-                    marker_cfg = CUBOID_MARKER_CFG.copy()
-                    marker_cfg.markers["cuboid"].size = (0.05, 0.05, 0.05)
+                    marker_cfg = SPHERE_MARKER_CFG.copy()
+                    marker_cfg.markers["sphere"].radius = 0.05
+                    # Set color to green (R, G, B)
+                    marker_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 1.0, 0.0)
                     marker_cfg.prim_path = f"/Visuals/Command/goal_position_{i}"
                     self.goal_pos_visualizers.append(VisualizationMarkers(marker_cfg))
             

@@ -94,7 +94,7 @@ class MoveUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=2048, env_spacing=3.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=2, env_spacing=3.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----

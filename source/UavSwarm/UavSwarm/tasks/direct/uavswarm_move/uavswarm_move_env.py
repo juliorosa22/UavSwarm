@@ -352,7 +352,9 @@ class MoveUAVSwarmEnv(DirectMARLEnv):
                 self.goal_pos_visualizers = []
                 for i in range(self.num_drones):
                     marker_cfg = CUBOID_MARKER_CFG.copy()
-                    marker_cfg.markers["cuboid"].size = (0.05, 0.05, 0.05)
+                    marker_cfg.markers["cuboid"].size = (0.02, 0.02, 0.02)
+                    marker_cfg.markers["cuboid"].visual_material.diffuse_color = (0.0, 1.0, 0.0)
+
                     marker_cfg.prim_path = f"/Visuals/Command/goal_position_{i}"
                     self.goal_pos_visualizers.append(VisualizationMarkers(marker_cfg))
             

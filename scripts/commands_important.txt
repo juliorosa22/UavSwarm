@@ -1,0 +1,4 @@
+
+https://isaac-sim.github.io/IsaacLab/main/source/overview/reinforcement-learning/rl_existing_scripts.html
+# execute from the root directory of the repository
+./isaaclab.sh -p -m tensorboard.main --logdir=logs
