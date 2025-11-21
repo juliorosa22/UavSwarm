@@ -1,7 +1,7 @@
 # IsaacLab UAV Swarm Navigation
 
 <p align="center">
-  <img src="assets/swarm_training.gif" width="80%" alt="UAV Swarm Hover Training Demo">
+  <img src="assets/swarm_progress.gif" width="80%" alt="UAV Swarm Hover Training Demo">
 </p>
 
 ## Overview
