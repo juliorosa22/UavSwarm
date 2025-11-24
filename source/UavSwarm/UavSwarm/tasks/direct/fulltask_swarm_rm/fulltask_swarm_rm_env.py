@@ -247,6 +247,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return state
 
+
+    ##TODO : adjust rewards weights and terms based on current stage in the curriculum
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         """Calculate rewards matching copy_quadenv.py logic + swarm terms.
         
@@ -304,7 +306,10 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Return dictionary with same reward for all agents (cooperative setting)
         return {f"robot_{i}": reward for i in range(self.num_drones)}
 
+
+    ## TODO : adjust termination conditions based on current stage in the curriculum
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        
         """Check termination conditions (matching copy_quadenv.py).
         
         Returns:
@@ -319,7 +324,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             died_list.append(
                 torch.logical_or(
                     rob.data.root_pos_w[:, 2] < 0.1, 
-                    rob.data.root_pos_w[:, 2] > 2.0
+                    rob.data.root_pos_w[:, 2] > self.cfg.curriculum.goal_height+1.0
                 )
             )
         died = torch.stack(died_list, dim=1).any(dim=1)
@@ -334,7 +339,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return terminated_dict, time_out_dict
 
-    def _reset_idx(self, env_ids: torch.Tensor | None):
+    def _reset_idx_old(self, env_ids: torch.Tensor | None):
         """Reset environments with inverted V formation for hovering task."""
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robots[0]._ALL_INDICES
@@ -464,50 +469,528 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             for i, viz in enumerate(self.goal_pos_visualizers):
                 viz.visualize(self._desired_pos_w[:, i, :])
     
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        """Reset environments with curriculum-dependent goals & scene adjustments."""
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robots[0]._ALL_INDICES
+
+        # -----------------------------------------------------
+        # 1. LOG EPISODIC METRICS (same from your code)
+        # -----------------------------------------------------
+        final_distances = []
+        for j in range(self.num_drones):
+            dist = torch.linalg.norm(
+                self._desired_pos_w[env_ids, j, :]
+                - self._robots[j].data.root_pos_w[env_ids],
+                dim=1,
+            )
+            final_distances.append(dist)
+        final_distance_to_goal = torch.stack(final_distances).mean()
+
+        # reward breakdown logs
+        log_dict = {}
+        for key in self._episode_sums.keys():
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            log_dict[f"Episode_Reward/{key}"] = episodic_sum_avg / self.max_episode_length_s
+            self._episode_sums[key][env_ids] = 0.0
+
+        # termination logs
+        log_dict["Episode_Termination/died"] = torch.count_nonzero(
+            self._last_terminated[env_ids]
+        ).item()
+        log_dict["Episode_Termination/time_out"] = torch.count_nonzero(
+            self._last_timed_out[env_ids]
+        ).item()
+        log_dict["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+
+        self.extras["log"] = log_dict
+
+        # reset termination state
+        self._last_terminated[env_ids] = False
+        self._last_timed_out[env_ids] = False
+
+        # -----------------------------------------------------
+        # 2. RESET ROBOTS TO DEFAULT STATE
+        # -----------------------------------------------------
+        for rob in self._robots:
+            rob.reset(env_ids)
+
+        super()._reset_idx(env_ids)
+
+        # desync episode starts
+        if len(env_ids) == self.num_envs:
+            self.episode_length_buf = torch.randint_like(
+                self.episode_length_buf, high=int(self.max_episode_length)
+            )
+
+        self._actions[env_ids] = 0.0
+
+        # -----------------------------------------------------
+        # 3. GET ENV ORIGINS
+        # -----------------------------------------------------
+        env_origins = self._terrain.env_origins[env_ids]
+
+        # -----------------------------------------------------
+        # 4. CURRICULUM LOGIC — SELECT THE RIGHT STAGE BEHAVIOR
+        # -----------------------------------------------------
+        stage = self.curriculum_stage
+
+        if stage == 1:
+            # Individual Hover
+            self._set_hover_goals(env_ids, env_origins)
+
+        elif stage == 2:
+            # Individual XY movement
+            self._set_individual_p2p_goals(env_ids, env_origins)
+
+        elif stage == 3:
+            # Individual XY + static obstacles
+            self._ensure_obstacles_built()
+            self._randomize_obstacles(env_ids, env_origins)
+            self._set_individual_p2p_goals_with_obstacles(env_ids, env_origins)
+
+        elif stage == 4:
+            # Swarm navigation (no obstacles)
+            self._set_swarm_navigation_goals(env_ids, env_origins)
+
+        else:  # stage == 5
+            # Swarm + obstacles
+            self._ensure_obstacles_built()
+            self._randomize_obstacles(env_ids, env_origins)
+            self._set_swarm_navigation_goals_with_obstacles(env_ids, env_origins)
+
+
 
 #### Helper Methods for adjusting agents targets positions based on curriculum stage
-
+    ###---- Stage 1: Individual Hover ----###
     def _set_hover_goals(self, env_ids, env_origins):
-        # All drones should hover around a local origin, separated in XY to avoid collisions.
-        # Example: keep XY close to origin, fixed Z height
-        goal_z = self.cfg.goal_height
-        xy_radius = 0.5  # small radius, but non-zero to avoid collisions
+        """Set hover goals - simplified grid version."""
+        ##This function places the drones in a grid formation at the start of the episode and assigns each drone a goal position directly above its start position at a certain height.
+        num_reset_envs = len(env_ids)
+        
+        # Create grid of start positions
+        grid_size = int(torch.ceil(torch.sqrt(torch.tensor(self.num_drones, dtype=torch.float32))))
+        spacing = max(0.5, self.cfg.min_sep)
+        
+        for env_idx in range(num_reset_envs):
+            # Random permutation for this environment
+            perm = torch.randperm(self.num_drones, device=self.device)
+            
+            # Sample heights
+            start_heights = torch.zeros(self.num_drones, device=self.device).uniform_(0.3, 0.6)
+            goal_heights = torch.zeros(self.num_drones, device=self.device).uniform_(
+                0.5, self.cfg.curriculum.goal_height
+            )
+            
+            for j, rob in enumerate(self._robots):
+                env_id_single = env_ids[env_idx].unsqueeze(0)
+                
+                # Grid position
+                grid_idx = perm[j].item()
+                grid_x = (grid_idx % grid_size) * spacing - (grid_size * spacing / 2.0)
+                grid_y = (grid_idx // grid_size) * spacing - (grid_size * spacing / 2.0)
+                
+                # Reset robot
+                joint_pos = rob.data.default_joint_pos[env_id_single]
+                joint_vel = rob.data.default_joint_vel[env_id_single]
+                default_root_state = rob.data.default_root_state[env_id_single].clone()
+                
+                # Start position
+                default_root_state[:, 0] = env_origins[env_idx, 0] + grid_x
+                default_root_state[:, 1] = env_origins[env_idx, 1] + grid_y
+                default_root_state[:, 2] = start_heights[j]
+                
+                rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
+                rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
+                rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
+                
+                # Goal position (minimal XY drift)
+                xy_noise = torch.zeros(2, device=self.device).uniform_(-0.05, 0.05)
+                self._desired_pos_w[env_id_single, j, 0] = default_root_state[0, 0] + xy_noise[0]
+                self._desired_pos_w[env_id_single, j, 1] = default_root_state[0, 1] + xy_noise[1]
+                self._desired_pos_w[env_id_single, j, 2] = goal_heights[j]
 
-        for j, rob in enumerate(self._robots):
-            # Place each drone slightly apart in XY
-            offset_x = (j - self.num_drones / 2.0) * 0.5
-            offset_y = 0.0
-            self._desired_pos_w[env_ids, j, 0] = env_origins[:, 0] + offset_x
-            self._desired_pos_w[env_ids, j, 1] = env_origins[:, 1] + offset_y
-            self._desired_pos_w[env_ids, j, 2] = goal_z
-
+    ###---- Stage 2: Individual Point-to-Point ----###
     def _set_individual_p2p_goals(self, env_ids, env_origins):
-        # Each drone starts at some point and must move to a *different* target,
-        # far enough in XY to avoid collisions.
-        goal_z = self.cfg.goal_height
+        """Set individual point-to-point goals for curriculum stage 2.
+        
+        Agents must learn to:
+        1. Navigate stably in XY plane at different heights
+        2. Rotate (yaw) to face the goal direction
+        3. Reach distant goals while avoiding inter-agent collisions
+        
+        Args:
+            env_ids: Indices of environments to reset
+            env_origins: Origins of environments, shape (num_reset_envs, 3)
+        """
+        num_reset_envs = len(env_ids)
+        
+        # Create grid of start positions
+        grid_size = int(torch.ceil(torch.sqrt(torch.tensor(self.num_drones, dtype=torch.float32))))
+        spacing = max(0.5, self.cfg.min_sep)
+        
+        # Calculate height stratification to prevent collisions
+        # Each drone operates on a different Z-plane
+        z_spacing = self.cfg.curriculum.z_distance_xy_plane
+        base_height = 0.5  # Minimum start height
+        
+        for env_idx in range(num_reset_envs):
+            # Random permutation for grid assignment
+            perm = torch.randperm(self.num_drones, device=self.device)
+            
+            # Assign heights to create vertical separation
+            # Heights increase with drone index to create layered formation
+            heights = torch.arange(self.num_drones, device=self.device, dtype=torch.float32)
+            heights = base_height + heights * z_spacing
+            
+            # Randomize height assignment (shuffle which drone gets which height layer)
+            height_perm = torch.randperm(self.num_drones, device=self.device)
+            assigned_heights = heights[height_perm]
+            
+            for j, rob in enumerate(self._robots):
+                env_id_single = env_ids[env_idx].unsqueeze(0)
+                
+                # -----------------------------------------------------
+                # 1. START POSITION: Grid formation with unique heights
+                # -----------------------------------------------------
+                grid_idx = perm[j].item()
+                grid_x = (grid_idx % grid_size) * spacing - (grid_size * spacing / 2.0)
+                grid_y = (grid_idx // grid_size) * spacing - (grid_size * spacing / 2.0)
+                
+                # Reset robot
+                joint_pos = rob.data.default_joint_pos[env_id_single]
+                joint_vel = rob.data.default_joint_vel[env_id_single]
+                default_root_state = rob.data.default_root_state[env_id_single].clone()
+                
+                # Set start position
+                start_x = env_origins[env_idx, 0] + grid_x
+                start_y = env_origins[env_idx, 1] + grid_y
+                start_z = assigned_heights[j]
+                
+                default_root_state[:, 0] = start_x
+                default_root_state[:, 1] = start_y
+                default_root_state[:, 2] = start_z
+                
+                # Write to simulation
+                rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
+                rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
+                rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
+                
+                # -----------------------------------------------------
+                # 2. GOAL POSITION: Distant in XY, similar Z
+                # -----------------------------------------------------
+                # Sample distance and angle for goal
+                goal_distance = torch.zeros(1, device=self.device).uniform_(
+                    0.5, 
+                    self.cfg.curriculum.goal_xy_distance
+                ).item()
+                
+                # Random angle in [0, 2π] to encourage yaw rotation
+                # This ensures the drone must turn to face the goal
+                goal_angle = torch.zeros(1, device=self.device).uniform_(
+                    0.0, 
+                    2.0 * torch.pi
+                ).item()
+                
+                # Calculate goal XY offset from start position
+                goal_offset_x = goal_distance * torch.cos(torch.tensor(goal_angle, device=self.device))
+                goal_offset_y = goal_distance * torch.sin(torch.tensor(goal_angle, device=self.device))
+                
+                # Goal position: start + offset
+                goal_x = start_x + goal_offset_x
+                goal_y = start_y + goal_offset_y
+                
+                # Goal height: same as start with small noise
+                goal_z_noise = torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+                goal_z = start_z + goal_z_noise
+                
+                # Set goal
+                self._desired_pos_w[env_id_single, j, 0] = goal_x
+                self._desired_pos_w[env_id_single, j, 1] = goal_y
+                self._desired_pos_w[env_id_single, j, 2] = goal_z
 
-        for j, rob in enumerate(self._robots):
-            # Example: sample random distant goal along +X direction
-            dx = torch.rand(len(env_ids), device=self.device) * 2.0 + 2.0  # [2,4] meters ahead
-            dy = (j - self.num_drones / 2.0) * 0.5
-            self._desired_pos_w[env_ids, j, 0] = env_origins[:, 0] + dx
-            self._desired_pos_w[env_ids, j, 1] = env_origins[:, 1] + dy
-            self._desired_pos_w[env_ids, j, 2] = goal_z
-
+    ###---- Stage 3: Individual Point-to-Point with Obstacles ----###
+    def _set_individual_p2p_goals_with_obstacles(self, env_ids, env_origins):
+        """Set individual point-to-point goals with static wall obstacles.
+        
+        Creates a barrier wall with gaps OFFSET from drone lanes, forcing drones to:
+        1. Detect the obstacle blocking their direct path
+        2. Search laterally for gaps between wall segments
+        3. Navigate around obstacles to reach goals behind the barrier
+        
+        Args:
+            env_ids: Indices of environments to reset
+            env_origins: Origins of environments, shape (num_reset_envs, 3)
+        """
+        num_reset_envs = len(env_ids)
+        
+        # Barrier configuration
+        obstacle_distance_from_start = 2.5  # Distance from start line to barrier
+        goal_distance_behind_obstacle = 2.0  # Distance from barrier to goal
+        
+        # Line formation for drones
+        line_spacing = 1.2  # Spacing between drones in line
+        base_height = 0.8   # Height for all drones
+        
+        # Wall segment dimensions
+        wall_thickness = 0.2        # Thin wall (20cm)
+        wall_segment_length = 0.9   # Length of each wall piece (covers most of lane)
+        wall_height = 2.5           # Tall enough to block drones
+        gap_width = 0.3             # Small gap between segments (forces maneuvering)
+        
+        # KEY: Offset gaps from drone lanes
+        gap_offset_from_lane = line_spacing / 2.0  # Gaps are between lanes, not aligned with them
+        
+        # Initialize obstacle positions storage
+        if not hasattr(self, '_obstacle_positions'):
+            self._obstacle_positions = {}
+        
+        for env_idx in range(num_reset_envs):
+            env_id_int = env_ids[env_idx].item()
+            
+            # Random permutation for line positions
+            perm = torch.randperm(self.num_drones, device=self.device)
+            
+            # Decide formation orientation (50% horizontal, 50% vertical)
+            horizontal_line = torch.rand(1, device=self.device).item() > 0.5
+            
+            # Calculate barrier center position
+            if horizontal_line:
+                barrier_x = env_origins[env_idx, 0] + obstacle_distance_from_start
+                barrier_y_center = env_origins[env_idx, 1]
+            else:
+                barrier_x_center = env_origins[env_idx, 0]
+                barrier_y = env_origins[env_idx, 1] + obstacle_distance_from_start
+            
+            # Create wall segments positioned to BLOCK each drone lane
+            # Gaps will be BETWEEN lanes (offset from drone paths)
+            num_wall_segments = self.num_drones
+            
+            for seg_idx in range(num_wall_segments):
+                if horizontal_line:
+                    # Horizontal barrier: walls extend in Y direction
+                    # Position walls to BLOCK each drone's lane
+                    drone_lane_offset = (seg_idx - (self.num_drones - 1) / 2.0) * line_spacing
+                    wall_x = barrier_x
+                    wall_y = barrier_y_center + drone_lane_offset  # Centered on drone lane
+                    wall_z = wall_height / 2.0
+                    
+                    # Wall oriented perpendicular to drone path (blocks the lane)
+                    wall_size = (wall_thickness, wall_segment_length, wall_height)
+                else:
+                    # Vertical barrier: walls extend in X direction
+                    drone_lane_offset = (seg_idx - (self.num_drones - 1) / 2.0) * line_spacing
+                    wall_x = barrier_x_center + drone_lane_offset  # Centered on drone lane
+                    wall_y = barrier_y
+                    wall_z = wall_height / 2.0
+                    
+                    # Wall oriented perpendicular to drone path
+                    wall_size = (wall_segment_length, wall_thickness, wall_height)
+                
+                # Store wall position and size
+                wall_key = (env_id_int, seg_idx)
+                self._obstacle_positions[wall_key] = {
+                    'position': (wall_x, wall_y, wall_z),
+                    'size': wall_size,
+                    'orientation': 'horizontal' if horizontal_line else 'vertical'
+                }
+            
+            # Now set drone start and goal positions
+            for j, rob in enumerate(self._robots):
+                env_id_single = env_ids[env_idx].unsqueeze(0)
+                
+                # -----------------------------------------------------
+                # DRONE START POSITION: Line formation
+                # -----------------------------------------------------
+                line_position = perm[j].item()
+                
+                if horizontal_line:
+                    start_x = env_origins[env_idx, 0]
+                    start_y = env_origins[env_idx, 1] + (line_position - (self.num_drones - 1) / 2.0) * line_spacing
+                else:
+                    start_x = env_origins[env_idx, 0] + (line_position - (self.num_drones - 1) / 2.0) * line_spacing
+                    start_y = env_origins[env_idx, 1]
+                
+                start_z = base_height
+                
+                # Reset robot
+                joint_pos = rob.data.default_joint_pos[env_id_single]
+                joint_vel = rob.data.default_joint_vel[env_id_single]
+                default_root_state = rob.data.default_root_state[env_id_single].clone()
+                
+                default_root_state[:, 0] = start_x
+                default_root_state[:, 1] = start_y
+                default_root_state[:, 2] = start_z
+                
+                rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
+                rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
+                rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
+                
+                # -----------------------------------------------------
+                # GOAL POSITION: Straight ahead through neighbor's gap
+                # -----------------------------------------------------
+                # Goal is directly behind the wall, aligned with start position
+                # Drone MUST move laterally to find gap before proceeding
+                
+                if horizontal_line:
+                    goal_x = start_x + obstacle_distance_from_start + goal_distance_behind_obstacle
+                    goal_y = start_y  # Aligned with start Y (BLOCKED by wall)
+                else:
+                    goal_x = start_x  # Aligned with start X (BLOCKED by wall)
+                    goal_y = start_y + obstacle_distance_from_start + goal_distance_behind_obstacle
+                
+                goal_z = start_z + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+                
+                self._desired_pos_w[env_id_single, j, 0] = goal_x
+                self._desired_pos_w[env_id_single, j, 1] = goal_y
+                self._desired_pos_w[env_id_single, j, 2] = goal_z
 
     def _ensure_obstacles_built(self):
+        """Create cuboid wall obstacle prims."""
         if self._obstacles_built:
             return
-        # Here we would create some prims like cubes on /World/envs/env_.*/Obstacle_k
-        # using sim_utils (e.g., CubeCfg, MeshCfg, etc.)
-        # For now, just mark as built.
+        
+        from isaaclab.sim.spawners.shapes import CuboidCfg
+        from isaaclab.sim.schemas.schemas_cfg import (
+            RigidBodyPropertiesCfg,
+            CollisionPropertiesCfg,
+        )
+        from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
+        
+        # Create wall segments for each environment
+        max_wall_segments = self.num_drones  # One wall per drone (blocks each lane)
+        
+        for env_idx in range(self.num_envs):
+            for seg_idx in range(max_wall_segments):
+                wall_path = f"/World/envs/env_{env_idx}/WallSegment_{seg_idx}"
+                
+                # Default wall configuration (will be resized in _randomize_obstacles)
+                wall_cfg = CuboidCfg(
+                    size=(0.2, 0.9, 2.5),  # Default size
+                    rigid_props=RigidBodyPropertiesCfg(
+                        rigid_body_enabled=True,
+                        kinematic_enabled=True,
+                        disable_gravity=True,
+                    ),
+                    collision_props=CollisionPropertiesCfg(
+                        collision_enabled=True,
+                    ),
+                    visual_material=PreviewSurfaceCfg(
+                        diffuse_color=(0.9, 0.1, 0.1),  # Red
+                        roughness=0.4,
+                        metallic=0.0,
+                    ),
+                )
+                
+                # Spawn at origin (will be repositioned)
+                wall_cfg.func(wall_path, wall_cfg, translation=(0.0, 0.0, 0.0))
+        
         self._obstacles_built = True
+        print(f"[INFO] Built {max_wall_segments} wall segments per environment")
 
     def _randomize_obstacles(self, env_ids, env_origins):
-        # Later: set obstacle positions in front of drones so that
-        # goals are behind obstacles (as you specified).
-        pass
+        """Position and resize wall segments based on stored configurations."""
+        if not hasattr(self, '_obstacle_positions') or not self._obstacle_positions:
+            return
+        
+        import omni.isaac.core.utils.prims as prim_utils
+        from pxr import UsdGeom, Gf
+        
+        for env_idx_in_batch, env_id in enumerate(env_ids):
+            env_id_int = env_id.item()
+            max_wall_segments = self.num_drones
+            
+            for seg_idx in range(max_wall_segments):
+                wall_path = f"/World/envs/env_{env_id_int}/WallSegment_{seg_idx}"
+                wall_key = (env_id_int, seg_idx)
+                
+                if wall_key in self._obstacle_positions and prim_utils.is_prim_path_valid(wall_path):
+                    wall_data = self._obstacle_positions[wall_key]
+                    pos = wall_data['position']
+                    size = wall_data['size']
+                    
+                    # Get the wall prim
+                    wall_prim = prim_utils.get_prim_at_path(wall_path)
+                    xformable = UsdGeom.Xformable(wall_prim)
+                    
+                    # Set position
+                    xformable.ClearXformOpOrder()
+                    translate_op = xformable.AddTranslateOp()
+                    translate_op.Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+                    
+                    # Update cube size (scale)
+                    cube = UsdGeom.Cube(wall_prim)
+                    if cube:
+                        scale_op = xformable.AddScaleOp()
+                        scale_op.Set(Gf.Vec3d(float(size[0]), float(size[1]), float(size[2])))
 
+
+    ###---- Stage 4: Swarm Navigation ----###
+    def _set_swarm_navigation_goals(self, env_ids, env_origins):
+        """Set swarm navigation goals with formation aligned to travel direction."""
+        num_reset_envs = len(env_ids)
+        
+        spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
+            self.cfg.spawn_height_range[0], 
+            self.cfg.spawn_height_range[1]
+        )
+        
+        # Start positions: Inverted V formation
+        formation_positions = self.get_inverted_v_formation(env_ids, env_origins, spawn_heights)
+        
+        # Reset robots
+        for j, rob in enumerate(self._robots):
+            joint_pos = rob.data.default_joint_pos[env_ids]
+            joint_vel = rob.data.default_joint_vel[env_ids]
+            default_root_state = rob.data.default_root_state[env_ids].clone()
+            default_root_state[:, :3] = formation_positions[:, j, :]
+            
+            rob.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+            rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+            rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        
+        # Goal positions
+        for env_idx in range(num_reset_envs):
+            env_id_single = env_ids[env_idx]
+            
+            # Sample translation
+            translation_distance = torch.zeros(1, device=self.device).uniform_(
+                self.cfg.curriculum.swarm_translation_distance_min,
+                self.cfg.curriculum.swarm_translation_distance_max
+            ).item()
+            
+            translation_angle = torch.zeros(1, device=self.device).uniform_(0.0, 2.0 * torch.pi).item()
+            
+            translation_x = translation_distance * torch.cos(torch.tensor(translation_angle, device=self.device))
+            translation_y = translation_distance * torch.sin(torch.tensor(translation_angle, device=self.device))
+            
+            # ALIGN V-formation to point toward travel direction
+            # rotation_angle = translation_angle (V apex points toward goal)
+            rotation_angle = translation_angle
+            
+            cos_theta = torch.cos(torch.tensor(rotation_angle, device=self.device))
+            sin_theta = torch.sin(torch.tensor(rotation_angle, device=self.device))
+            
+            formation_center = formation_positions[env_idx].mean(dim=0)
+            
+            for j in range(self.num_drones):
+                start_pos = formation_positions[env_idx, j]
+                relative_pos = start_pos[:2] - formation_center[:2]
+                
+                # Rotate relative position
+                rotated_x = cos_theta * relative_pos[0] - sin_theta * relative_pos[1]
+                rotated_y = sin_theta * relative_pos[0] + cos_theta * relative_pos[1]
+                
+                # Translate to goal
+                goal_x = formation_center[0] + translation_x + rotated_x
+                goal_y = formation_center[1] + translation_y + rotated_y
+                goal_z = start_pos[2] + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+                
+                self._desired_pos_w[env_id_single, j, 0] = goal_x
+                self._desired_pos_w[env_id_single, j, 1] = goal_y
+                self._desired_pos_w[env_id_single, j, 2] = goal_z
+
+###---- Formation Helper Method: Inverted V Formation ----###
 
     def get_inverted_v_formation(self, env_ids: torch.Tensor, env_origins: torch.Tensor, spawn_heights: torch.Tensor) -> torch.Tensor:
         """Calculate inverted V formation positions for all drones in specified environments.

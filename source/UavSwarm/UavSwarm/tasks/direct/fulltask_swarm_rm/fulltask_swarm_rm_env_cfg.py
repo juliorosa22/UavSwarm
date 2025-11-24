@@ -52,9 +52,12 @@ class CurriculumCfg:
     stage3_end: int = 7_000_000   # Obstacle navigation
     stage4_end: int = 8_000_000   # Swarm navigation
     stage5_end: int = 10_000_000  # Swarm + obstacles (final)
-
-
-
+    goal_height: float = 5.0  # constant goal height for all stages
+    z_distance_xy_plane: float = 1.0  # z- distance between each agent xy-plane this will mitigate collisions during the training
+    goal_xy_distance:float = 3.0  # xy-distance for point-to-point and obstacle navigation stages
+    swarm_translation_distance_min: float = 0.5  # Minimum formation translation (meters)
+    swarm_translation_distance_max: float = 2.0  # Maximum formation translation (meters
+    
 @configclass
 class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     """
