@@ -54,7 +54,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     def __init__(self, cfg: FullTaskUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
         
         self.num_drones = cfg.num_agents        
-        
+        self.global_step=0
+        self.curriculum_stage=1
+        self._obstacles_built=False
         # Initialize lists (before parent __init__)
         self._robots = []
         self._body_ids = []
@@ -151,7 +153,26 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 body_ids=self._body_ids[j]
             )
     # as in the link tutorial: For asymmetric policies, the dictionary should also include the key critic and the states buffer as the value.
-    
+    def _post_physics_step(self):
+        """Update curriculum stage based on global step."""
+        self.global_step += 1
+        # Update curriculum stage if applicable
+        self.update_curriculum_stage()
+
+    def update_curriculum_stage(self):
+        step = self.global_step
+        c = self.cfg.curriculum
+        if step <= c.stage1_end:
+            self.curriculum_stage = 1   # Hovering (individual)
+        elif step <= c.stage2_end:
+            self.curriculum_stage = 2   # Point-to-point (individual)
+        elif step <= c.stage3_end:
+            self.curriculum_stage = 3   # Point-to-point + obstacles
+        elif step <= c.stage4_end:
+            self.curriculum_stage = 4   # Swarm navigation
+        else:
+            self.curriculum_stage = 5   # Swarm + obstacles
+
     def _get_observations(self) -> dict:
         """Get observations for each drone (12 dims per drone).
         
@@ -365,102 +386,57 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Get environment origins
         env_origins = self._terrain.env_origins[env_ids]
         num_reset_envs = len(env_ids)
-        
-        # Calculate inverted V formation positions
-        # Inverted V: apex at front (negative X), wings spread backward and outward
-        v_angle_rad = torch.deg2rad(torch.tensor(self.cfg.formation_v_angle_deg, device=self.device))
-        base_sep = self.cfg.formation_base_separation
-        
-        # Scale separation based on max_num_agents to ensure formation fits
-        # For max agents, we want to maintain minimum separation
-        scale_factor = max(1.0, self.cfg.min_sep / base_sep)
-        effective_sep = base_sep * scale_factor
-        
-        # Generate formation positions for each drone
-        formation_positions = torch.zeros(self.num_drones, 3, device=self.device)
-        
-        if self.num_drones == 1:
-            # Single drone: centered at origin
-            formation_positions[0] = torch.tensor([0.0, 0.0, 0.0], device=self.device)
-        else:
-            # Multiple drones: inverted V formation
-            # Apex drone (index 0) at the front (negative X)
-            apex_idx = 0
-            formation_positions[apex_idx, 0] = self.cfg.formation_apex_offset  # X position (front)
-            formation_positions[apex_idx, 1] = 0.0  # Y position (centered)
-            
-            # Distribute remaining drones on left and right wings
-            remaining_drones = self.num_drones - 1
-            left_wing_count = remaining_drones // 2
-            right_wing_count = remaining_drones - left_wing_count
-            
-            # Left wing (negative Y)
-            for i in range(left_wing_count):
-                wing_idx = i + 1
-                x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
-                y_offset = -(i + 1) * effective_sep * torch.sin(v_angle_rad)  # Left
-                formation_positions[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
-                formation_positions[wing_idx, 1] = y_offset
-            
-            # Right wing (positive Y)
-            for i in range(right_wing_count):
-                wing_idx = left_wing_count + i + 1
-                x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
-                y_offset = (i + 1) * effective_sep * torch.sin(v_angle_rad)  # Right
-                formation_positions[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
-                formation_positions[wing_idx, 1] = y_offset
-        
-        # Verify minimum separation constraint
-        if self.num_drones > 1:
-            dists = torch.cdist(formation_positions.unsqueeze(0), formation_positions.unsqueeze(0)).squeeze(0)
-            # Set diagonal to large value to ignore self-distances
-            dists = dists + torch.eye(self.num_drones, device=self.device) * 1000.0
-            min_dist = dists.min()
-            
-            # If constraint violated, scale up the formation
-            if min_dist < self.cfg.min_sep:
-                scale_up = self.cfg.min_sep / min_dist
-                formation_positions[:, :2] *= scale_up
 
-        # Sample random spawn heights for each environment
-        spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
-            self.cfg.spawn_height_range[0], 
-            self.cfg.spawn_height_range[1]
-        )
+            # Set targets positions based on curriculum stage
+        if self.curriculum_stage == 1:
+            self._set_hover_goals(env_ids, env_origins)
+        elif self.curriculum_stage == 2:
+            self._set_individual_p2p_goals(env_ids, env_origins)
+        elif self.curriculum_stage == 3:
+            self._set_individual_p2p_goals_with_obstacles(env_ids, env_origins)
+        elif self.curriculum_stage == 4:
+            self._set_swarm_navigation_goals(env_ids, env_origins)
+        else:  # stage 5
+            self._set_swarm_navigation_goals_with_obstacles(env_ids, env_origins)
 
-        # Reset each robot with formation-based positions
-        for j, rob in enumerate(self._robots):
-            # Get formation offset for this drone
-            formation_offset = formation_positions[j]  # (3,)
+        # Optionally: reposition obstacles when used
+        if self.curriculum_stage in (3, 5):
+            self._ensure_obstacles_built()
+            self._randomize_obstacles(env_ids, env_origins)
+
+        ##OLD logic from V formation implementation
+        # # Sample random spawn heights for each environment
+        # spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
+        #     self.cfg.spawn_height_range[0], 
+        #     self.cfg.spawn_height_range[1]
+        # )
+
+        # # Calculate inverted V formation positions for all drones in all resetting environments
+        # formation_positions = self._get_inverted_v_formation(env_ids, env_origins, spawn_heights)  
+        # # Shape: (num_reset_envs, num_drones, 3)
+
+        # # Reset each robot with formation-based positions
+        # for j, rob in enumerate(self._robots):
+        #     # Reset robot state
+        #     joint_pos = rob.data.default_joint_pos[env_ids]
+        #     joint_vel = rob.data.default_joint_vel[env_ids]
+        #     default_root_state = rob.data.default_root_state[env_ids].clone()
             
-            # Expand to batch dimension
-            formation_offset_batch = formation_offset.unsqueeze(0).expand(num_reset_envs, -1)  # (num_reset_envs, 3)
+        #     # Set position from precomputed formation
+        #     default_root_state[:, :3] = formation_positions[:, j, :]  # (num_reset_envs, 3)
             
-            # Reset robot state with formation offset
-            joint_pos = rob.data.default_joint_pos[env_ids]
-            joint_vel = rob.data.default_joint_vel[env_ids]
-            default_root_state = rob.data.default_root_state[env_ids].clone()
+        #     # Write to simulation
+        #     rob.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        #     rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+        #     rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
             
-            # Set position: env_origin + formation_offset + spawn_height
-            default_root_state[:, :2] = env_origins[:, :2] + formation_offset_batch[:, :2]
-            default_root_state[:, 2] = spawn_heights + formation_offset_batch[:, 2]
+        #     # Set goal position for hovering task:
+        #     # Goal = spawn position + vertical offset + small XY noise
+        #     self._desired_pos_w[env_ids, j, :2] = formation_positions[:, j, :2] + torch.zeros(
+        #         num_reset_envs, 2, device=self.device
+        #     ).uniform_(-self.cfg.goal_xy_noise, self.cfg.goal_xy_noise)
             
-            # Write to simulation
-            rob.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-            rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-            rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-            
-            # Set goal position for hovering task:
-            # Goal = spawn position + vertical offset + small XY noise
-            self._desired_pos_w[env_ids, j, :2] = default_root_state[:, :2] + torch.zeros_like(
-                default_root_state[:, :2]
-            ).uniform_(-self.cfg.goal_xy_noise, self.cfg.goal_xy_noise)
-            
-            self._desired_pos_w[env_ids, j, 2] = (
-                spawn_heights + 
-                formation_offset_batch[:, 2] + 
-                self.cfg.hover_height_offset
-            )
+        #     self._desired_pos_w[env_ids, j, 2] = formation_positions[:, j, 2] + self.cfg.hover_height_offset
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Enable/disable debug visualization (matching copy_quadenv.py)."""
@@ -487,3 +463,133 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         if hasattr(self, "goal_pos_visualizers"):
             for i, viz in enumerate(self.goal_pos_visualizers):
                 viz.visualize(self._desired_pos_w[:, i, :])
+    
+
+#### Helper Methods for adjusting agents targets positions based on curriculum stage
+
+    def _set_hover_goals(self, env_ids, env_origins):
+        # All drones should hover around a local origin, separated in XY to avoid collisions.
+        # Example: keep XY close to origin, fixed Z height
+        goal_z = self.cfg.goal_height
+        xy_radius = 0.5  # small radius, but non-zero to avoid collisions
+
+        for j, rob in enumerate(self._robots):
+            # Place each drone slightly apart in XY
+            offset_x = (j - self.num_drones / 2.0) * 0.5
+            offset_y = 0.0
+            self._desired_pos_w[env_ids, j, 0] = env_origins[:, 0] + offset_x
+            self._desired_pos_w[env_ids, j, 1] = env_origins[:, 1] + offset_y
+            self._desired_pos_w[env_ids, j, 2] = goal_z
+
+    def _set_individual_p2p_goals(self, env_ids, env_origins):
+        # Each drone starts at some point and must move to a *different* target,
+        # far enough in XY to avoid collisions.
+        goal_z = self.cfg.goal_height
+
+        for j, rob in enumerate(self._robots):
+            # Example: sample random distant goal along +X direction
+            dx = torch.rand(len(env_ids), device=self.device) * 2.0 + 2.0  # [2,4] meters ahead
+            dy = (j - self.num_drones / 2.0) * 0.5
+            self._desired_pos_w[env_ids, j, 0] = env_origins[:, 0] + dx
+            self._desired_pos_w[env_ids, j, 1] = env_origins[:, 1] + dy
+            self._desired_pos_w[env_ids, j, 2] = goal_z
+
+
+    def _ensure_obstacles_built(self):
+        if self._obstacles_built:
+            return
+        # Here we would create some prims like cubes on /World/envs/env_.*/Obstacle_k
+        # using sim_utils (e.g., CubeCfg, MeshCfg, etc.)
+        # For now, just mark as built.
+        self._obstacles_built = True
+
+    def _randomize_obstacles(self, env_ids, env_origins):
+        # Later: set obstacle positions in front of drones so that
+        # goals are behind obstacles (as you specified).
+        pass
+
+
+    def get_inverted_v_formation(self, env_ids: torch.Tensor, env_origins: torch.Tensor, spawn_heights: torch.Tensor) -> torch.Tensor:
+        """Calculate inverted V formation positions for all drones in specified environments.
+        
+        Args:
+            env_ids: Indices of environments to reset
+            env_origins: Origins of the environments being reset, shape (num_reset_envs, 3)
+            spawn_heights: Height offset for each environment, shape (num_reset_envs,)
+        
+        Returns:
+            Tensor of shape (num_reset_envs, num_drones, 3) with absolute world positions 
+            for each drone in each environment.
+        """
+        num_reset_envs = len(env_ids)
+        
+        # Inverted V: apex at front (negative X), wings spread backward and outward
+        v_angle_rad = torch.deg2rad(torch.tensor(self.cfg.formation_v_angle_deg, device=self.device))
+        base_sep = self.cfg.formation_base_separation
+        
+        # Scale separation based on max_num_agents to ensure formation fits
+        scale_factor = max(1.0, self.cfg.min_sep / base_sep)
+        effective_sep = base_sep * scale_factor
+        
+        # Generate formation positions template for each drone
+        formation_template = torch.zeros(self.num_drones, 3, device=self.device)
+        
+        if self.num_drones == 1:
+            # Single drone: centered at origin
+            formation_template[0] = torch.tensor([0.0, 0.0, 0.0], device=self.device)
+        else:
+            # Multiple drones: inverted V formation
+            # Apex drone (index 0) at the front (negative X)
+            apex_idx = 0
+            formation_template[apex_idx, 0] = self.cfg.formation_apex_offset  # X position (front)
+            formation_template[apex_idx, 1] = 0.0  # Y position (centered)
+            
+            # Distribute remaining drones on left and right wings
+            remaining_drones = self.num_drones - 1
+            left_wing_count = remaining_drones // 2
+            right_wing_count = remaining_drones - left_wing_count
+            
+            # Left wing (negative Y)
+            for i in range(left_wing_count):
+                wing_idx = i + 1
+                x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
+                y_offset = -(i + 1) * effective_sep * torch.sin(v_angle_rad)  # Left
+                formation_template[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
+                formation_template[wing_idx, 1] = y_offset
+            
+            # Right wing (positive Y)
+            for i in range(right_wing_count):
+                wing_idx = left_wing_count + i + 1
+                x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
+                y_offset = (i + 1) * effective_sep * torch.sin(v_angle_rad)  # Right
+                formation_template[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
+                formation_template[wing_idx, 1] = y_offset
+    
+        # Verify minimum separation constraint
+        if self.num_drones > 1:
+            dists = torch.cdist(formation_template.unsqueeze(0), formation_template.unsqueeze(0)).squeeze(0)
+            # Set diagonal to large value to ignore self-distances
+            dists = dists + torch.eye(self.num_drones, device=self.device) * 1000.0
+            min_dist = dists.min()
+            
+            # If constraint violated, scale up the formation
+            if min_dist < self.cfg.min_sep:
+                scale_up = self.cfg.min_sep / min_dist
+                formation_template[:, :2] *= scale_up
+    
+        # Expand template to all resetting environments
+        # formation_template: (num_drones, 3)
+        # Result: (num_reset_envs, num_drones, 3)
+        formation_positions = formation_template.unsqueeze(0).expand(num_reset_envs, -1, -1).clone()
+        
+        # Add environment origins (XY) to all drones in each environment
+        # env_origins: (num_reset_envs, 3)
+        # Broadcast: (num_reset_envs, 1, 2) + (num_reset_envs, num_drones, 2)
+        formation_positions[:, :, :2] += env_origins[:, :2].unsqueeze(1)
+        
+        # Add spawn heights (Z) to all drones in each environment
+        # spawn_heights: (num_reset_envs,)
+        # Broadcast: (num_reset_envs, 1) + (num_reset_envs, num_drones)
+        formation_positions[:, :, 2] += spawn_heights.unsqueeze(1)
+        
+        return formation_positions  # Shape: (num_reset_envs, num_drones, 3)

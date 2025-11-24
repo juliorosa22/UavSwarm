@@ -42,17 +42,31 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 
 
 @configclass
+class CurriculumCfg:
+    # total training horizon (for reference)
+    total_steps: int = 10_000_000
+
+    # boundaries between stages (in environment steps)
+    stage1_end: int = 1_000_000   # Hovering
+    stage2_end: int = 4_000_000   # Point-to-point
+    stage3_end: int = 7_000_000   # Obstacle navigation
+    stage4_end: int = 8_000_000   # Swarm navigation
+    stage5_end: int = 10_000_000  # Swarm + obstacles (final)
+
+
+
+@configclass
 class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     """
     Direct MARL workflow for UAV Swarm with multiple Crazyflies per environment.
     """
 
     # ----- Episode / stepping -----
-    episode_length_s = 20.0
+    episode_length_s = 30.0
     decimation = 2
     num_agents: int = 5
     max_num_agents: int = 20
-    
+    curriculum:CurriculumCfg = CurriculumCfg()
     # MARL-specific: Define spaces for all agents
     # Per-agent action/observation dimensions
     single_action_space = 4  # thrust + 3 moments per drone

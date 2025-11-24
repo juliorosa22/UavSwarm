@@ -1,0 +1,23 @@
+**Guidelines for implement curriculum learning:
+I need your help on adjusting my current code in #file:fulltask_swarm_rm_env.py and #file:fulltask_swarm_rm_env_cfg.py in order to implement curriculum learning. The idea is to break the broad swarm navigation task into stage learning:
+(individual stages)
+1 - Hovering: agents should learn how to perform a stable hover at some defined altitude in z axis.
+2- Move point-to-point: here the agents must learn how to perform a stable navigation from start point to a final position while trying to keep a stable height.
+3 -Obstacle navigation: here the agents must learn how to reach the final destination while avoinding static obstacle in the environment
+(Swarm stages)
+4 - Swarm Navigation: here the agents must learn how to perform a cooperative navigation while keeping a safe distance from each other.
+5 - Swarm obstacle: the swarm should learn how to avoid static obstacles in order to reach its final destination.
+
+**Transition logic for each stage
+-Mainly what will change between each stage will be the final positions for each UAV agent.
+
+On Individual stages the final destination for each UAV should be somehow distant to not allow collisions.
+During the stages with static obstacles it will be necessary to change the environment dinamically in order to add static obstacles. In such stage the final destination for the UAVs should be placed after the obstacle position, so that the agent must learn to avoid the obstacle.
+The agents should have added some distant sensor , check for isaaclab alternatives.
+The changes in the environment during the training should occur after some iteration for example:
+Total training iteration:10M
+stage 1: 0 - 1M
+stage 2 :1M - 4M
+stage 3: 4M - 7M
+stage 4: 7M - 8M
+stage 5:8M - 10M
