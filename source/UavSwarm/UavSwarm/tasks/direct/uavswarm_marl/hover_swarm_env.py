@@ -14,7 +14,7 @@ from isaaclab.markers import VisualizationMarkers
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils.math import subtract_frame_transforms
 
-from .uavswarm_marl_env_cfg import HoverUAVSwarmEnvCfg
+from .hover_swarm_env_cfg import HoverUAVSwarmEnvCfg
 
 from isaaclab.markers import SPHERE_MARKER_CFG  # isort: skip
 
