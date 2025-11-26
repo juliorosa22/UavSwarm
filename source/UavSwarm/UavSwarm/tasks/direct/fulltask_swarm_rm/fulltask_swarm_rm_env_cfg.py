@@ -52,12 +52,29 @@ class CurriculumCfg:
     stage3_end: int = 7_000_000   # Obstacle navigation
     stage4_end: int = 8_000_000   # Swarm navigation
     stage5_end: int = 10_000_000  # Swarm + obstacles (final)
-    goal_height: float = 5.0  # constant goal height for all stages
+    
+    # Stage-specific spatial offsets (where agents spawn)
+    # Stages 1, 2, 4: origin at (0, 0)
+    # Stage 3: origin at (stage3_offset_x, stage3_offset_y) where obstacles are
+    # Stage 5: origin at (stage5_offset_x, stage5_offset_y) where obstacles are
+    stage3_offset_x: float = 20.0  # Move agents 20m in X for stage 3
+    stage3_offset_y: float = 0.0   # Keep Y centered
+    stage5_offset_x: float = 0.0   # Keep X centered for stage 5
+    stage5_offset_y: float = 20.0  # Move agents 20m in Y for stage 5
+    
+    
+    goal_height_range: tuple = (1.0, 3.0)  # height range for all stages, should be below obstacle height
     z_distance_xy_plane: float = 1.0  # z- distance between each agent xy-plane this will mitigate collisions during the training
-    goal_xy_distance:float = 3.0  # xy-distance for point-to-point and obstacle navigation stages
+    goal_xy_distance:float = 10.0  # xy-distance for point-to-point and obstacle navigation stages
+    
     swarm_translation_distance_min: float = 0.5  # Minimum formation translation (meters)
     swarm_translation_distance_max: float = 2.0  # Maximum formation translation (meters
     
+    spawn_heigtht_range: tuple = (0.5, 0.8)  # spawn height range for all stages
+    spawn_grid_spacing_range: tuple = (0.5, 1.0)  # spacing range for grid spawn positions
+
+
+
 @configclass
 class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     """
@@ -67,7 +84,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     # ----- Episode / stepping -----
     episode_length_s = 30.0
     decimation = 2
-    num_agents: int = 5
+    num_agents: int = 3
     max_num_agents: int = 20
     curriculum:CurriculumCfg = CurriculumCfg()
     # MARL-specific: Define spaces for all agents
@@ -121,7 +138,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=32, env_spacing=5.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=2, env_spacing=50.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----

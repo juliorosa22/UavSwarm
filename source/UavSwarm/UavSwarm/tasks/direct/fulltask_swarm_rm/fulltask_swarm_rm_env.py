@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+import isaacsim.core.utils.prims as prim_utils
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
@@ -15,7 +16,6 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils.math import subtract_frame_transforms
 
 from .fulltask_swarm_rm_env_cfg import FullTaskUAVSwarmEnvCfg
-
 from isaaclab.markers import SPHERE_MARKER_CFG  # isort: skip
 
 #check out https://isaac-sim.github.io/IsaacLab/main/source/tutorials/03_envs/create_direct_rl_env.html for more details on the functions implemented in DirectMARLEnv workflow
@@ -54,8 +54,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     def __init__(self, cfg: FullTaskUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
         
         self.num_drones = cfg.num_agents        
-        self.global_step=0
-        self.curriculum_stage=1
+        self.global_step=3_999_990
+        self.curriculum_stage=2
         self._obstacles_built=False
         # Initialize lists (before parent __init__)
         self._robots = []
@@ -111,6 +111,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self.scene.articulations[f"robot_{i}"] = robot
             self._robots.append(robot)
 
+        # Build all obstacles before simulation
+        self._build_all_obstacles()
+
         # Clone environments
         self.scene.clone_environments(copy_from_source=False)
         
@@ -129,6 +132,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             actions: Dictionary mapping agent names to action tensors.
                      Each tensor has shape (num_envs, action_dim)
         """
+        self.global_step += 1
+        self.update_curriculum_stage()
         # Convert dictionary to stacked tensor: (num_envs, num_drones, 4)
         actions_list = []
         for i in range(self.num_drones):
@@ -153,26 +158,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 body_ids=self._body_ids[j]
             )
     # as in the link tutorial: For asymmetric policies, the dictionary should also include the key critic and the states buffer as the value.
-    def _post_physics_step(self):
-        """Update curriculum stage based on global step."""
-        self.global_step += 1
-        # Update curriculum stage if applicable
-        self.update_curriculum_stage()
 
-    def update_curriculum_stage(self):
-        step = self.global_step
-        c = self.cfg.curriculum
-        if step <= c.stage1_end:
-            self.curriculum_stage = 1   # Hovering (individual)
-        elif step <= c.stage2_end:
-            self.curriculum_stage = 2   # Point-to-point (individual)
-        elif step <= c.stage3_end:
-            self.curriculum_stage = 3   # Point-to-point + obstacles
-        elif step <= c.stage4_end:
-            self.curriculum_stage = 4   # Swarm navigation
-        else:
-            self.curriculum_stage = 5   # Swarm + obstacles
 
+    
     def _get_observations(self) -> dict:
         """Get observations for each drone (12 dims per drone).
         
@@ -324,7 +312,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             died_list.append(
                 torch.logical_or(
                     rob.data.root_pos_w[:, 2] < 0.1, 
-                    rob.data.root_pos_w[:, 2] > self.cfg.curriculum.goal_height+1.0
+                    rob.data.root_pos_w[:, 2] > 15.0
                 )
             )
         died = torch.stack(died_list, dim=1).any(dim=1)
@@ -339,110 +327,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return terminated_dict, time_out_dict
 
-    def _reset_idx_old(self, env_ids: torch.Tensor | None):
-        """Reset environments with inverted V formation for hovering task."""
-        if env_ids is None or len(env_ids) == self.num_envs:
-            env_ids = self._robots[0]._ALL_INDICES
-
-        # Logging (matching copy_quadenv.py)
-        final_distances = []
-        for j in range(self.num_drones):
-            dist = torch.linalg.norm(
-                self._desired_pos_w[env_ids, j, :] - self._robots[j].data.root_pos_w[env_ids], 
-                dim=1
-            )
-            final_distances.append(dist)
-        final_distance_to_goal = torch.stack(final_distances).mean()
-
-        extras = {}
-        for key in self._episode_sums.keys():
-            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-            extras["Episode_Reward/" + key] = episodic_sum_avg / self.max_episode_length_s
-            self._episode_sums[key][env_ids] = 0.0
-        
-        self.extras["log"] = {}
-        self.extras["log"].update(extras)
-        
-        extras = {}
-        # Use stored termination info for logging
-        extras["Episode_Termination/died"] = torch.count_nonzero(self._last_terminated[env_ids]).item()
-        extras["Episode_Termination/time_out"] = torch.count_nonzero(self._last_timed_out[env_ids]).item()
-        extras["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
-        self.extras["log"].update(extras)
-
-        # Reset termination tracking
-        self._last_terminated[env_ids] = False
-        self._last_timed_out[env_ids] = False
-
-        # Reset all robots
-        for rob in self._robots:
-            rob.reset(env_ids)
-        
-        super()._reset_idx(env_ids)
-        
-        # Spread out resets (matching copy_quadenv.py)
-        if len(env_ids) == self.num_envs:
-            self.episode_length_buf = torch.randint_like(
-                self.episode_length_buf, high=int(self.max_episode_length)
-            )
-
-        self._actions[env_ids] = 0.0
-
-        # Get environment origins
-        env_origins = self._terrain.env_origins[env_ids]
-        num_reset_envs = len(env_ids)
-
-            # Set targets positions based on curriculum stage
-        if self.curriculum_stage == 1:
-            self._set_hover_goals(env_ids, env_origins)
-        elif self.curriculum_stage == 2:
-            self._set_individual_p2p_goals(env_ids, env_origins)
-        elif self.curriculum_stage == 3:
-            self._set_individual_p2p_goals_with_obstacles(env_ids, env_origins)
-        elif self.curriculum_stage == 4:
-            self._set_swarm_navigation_goals(env_ids, env_origins)
-        else:  # stage 5
-            self._set_swarm_navigation_goals_with_obstacles(env_ids, env_origins)
-
-        # Optionally: reposition obstacles when used
-        if self.curriculum_stage in (3, 5):
-            self._ensure_obstacles_built()
-            self._randomize_obstacles(env_ids, env_origins)
-
-        ##OLD logic from V formation implementation
-        # # Sample random spawn heights for each environment
-        # spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
-        #     self.cfg.spawn_height_range[0], 
-        #     self.cfg.spawn_height_range[1]
-        # )
-
-        # # Calculate inverted V formation positions for all drones in all resetting environments
-        # formation_positions = self._get_inverted_v_formation(env_ids, env_origins, spawn_heights)  
-        # # Shape: (num_reset_envs, num_drones, 3)
-
-        # # Reset each robot with formation-based positions
-        # for j, rob in enumerate(self._robots):
-        #     # Reset robot state
-        #     joint_pos = rob.data.default_joint_pos[env_ids]
-        #     joint_vel = rob.data.default_joint_vel[env_ids]
-        #     default_root_state = rob.data.default_root_state[env_ids].clone()
-            
-        #     # Set position from precomputed formation
-        #     default_root_state[:, :3] = formation_positions[:, j, :]  # (num_reset_envs, 3)
-            
-        #     # Write to simulation
-        #     rob.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        #     rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        #     rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-            
-        #     # Set goal position for hovering task:
-        #     # Goal = spawn position + vertical offset + small XY noise
-        #     self._desired_pos_w[env_ids, j, :2] = formation_positions[:, j, :2] + torch.zeros(
-        #         num_reset_envs, 2, device=self.device
-        #     ).uniform_(-self.cfg.goal_xy_noise, self.cfg.goal_xy_noise)
-            
-        #     self._desired_pos_w[env_ids, j, 2] = formation_positions[:, j, 2] + self.cfg.hover_height_offset
-
+    
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Enable/disable debug visualization (matching copy_quadenv.py)."""
         if debug_vis:
@@ -534,43 +419,61 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # 4. CURRICULUM LOGIC — SELECT THE RIGHT STAGE BEHAVIOR
         # -----------------------------------------------------
         stage = self.curriculum_stage
-
+        #print(f"Global step: {self.global_step}, Curriculum stage: {stage}")
         if stage == 1:
             # Individual Hover
-            self._set_hover_goals(env_ids, env_origins)
-
+            self._set_stage1_positions(env_ids, env_origins)
         elif stage == 2:
             # Individual XY movement
-            self._set_individual_p2p_goals(env_ids, env_origins)
-
+            self._set_stage2_positions(env_ids, env_origins)
         elif stage == 3:
-            # Individual XY + static obstacles
-            self._ensure_obstacles_built()
-            self._randomize_obstacles(env_ids, env_origins)
-            self._set_individual_p2p_goals_with_obstacles(env_ids, env_origins)
-
+            # Individual Point-to-Point with Obstacles
+            self._set_stage3_positions(env_ids, env_origins)        
         elif stage == 4:
-            # Swarm navigation (no obstacles)
-            self._set_swarm_navigation_goals(env_ids, env_origins)
-
+            # Swarm navigation (no obstacles)            
+            self._set_stage4_positions(env_ids, env_origins)
         else:  # stage == 5
-            # Swarm + obstacles
-            self._ensure_obstacles_built()
-            self._randomize_obstacles(env_ids, env_origins)
-            self._set_swarm_navigation_goals_with_obstacles(env_ids, env_origins)
+            self._set_stage5_positions(env_ids, env_origins)
+            
+            
 
 
 
-#### Helper Methods for adjusting agents targets positions based on curriculum stage
+#### Curriculum methods for adjusting agents targets positions and environment obstacles based on curriculum stage
+    def update_curriculum_stage(self):
+        step = self.global_step
+        c = self.cfg.curriculum
+        if step <= c.stage1_end:
+            if self.curriculum_stage != 1:
+                print("Changed to curriculum stage 1: Individual Hover")
+            self.curriculum_stage = 1   # Hovering (individual)
+        elif step <= c.stage2_end:
+            if self.curriculum_stage != 2:
+                print("Changed to curriculum stage 2: Individual Point-to-Point")
+            self.curriculum_stage = 2   # Point-to-point (individual)
+        elif step <= c.stage3_end:
+            if self.curriculum_stage != 3:
+                print("Changed to curriculum stage 3: Individual Point-to-Point with Obstacles")
+            self.curriculum_stage = 3   # Point-to-point + obstacles
+        elif step <= c.stage4_end:
+            if self.curriculum_stage != 4:
+                print("Changed to curriculum stage 4: Swarm Navigation without Obstacles")
+            self.curriculum_stage = 4   # Swarm navigation
+        else:
+            if self.curriculum_stage != 5:
+                print("Changed to curriculum stage 5: Swarm Navigation with Obstacles")
+            self.curriculum_stage = 5   # Swarm + obstacles
+
+    
     ###---- Stage 1: Individual Hover ----###
-    def _set_hover_goals(self, env_ids, env_origins):
+    def _set_stage1_positions(self, env_ids, env_origins):
         """Set hover goals - simplified grid version."""
         ##This function places the drones in a grid formation at the start of the episode and assigns each drone a goal position directly above its start position at a certain height.
         num_reset_envs = len(env_ids)
         
         # Create grid of start positions
         grid_size = int(torch.ceil(torch.sqrt(torch.tensor(self.num_drones, dtype=torch.float32))))
-        spacing = max(0.5, self.cfg.min_sep)
+        spacing = torch.zeros(1,device=self.device).uniform_(self.cfg.curriculum.spawn_grid_spacing_range[0], self.cfg.curriculum.spawn_grid_spacing_range[1])#max(0.5, self.cfg.min_sep)
         
         for env_idx in range(num_reset_envs):
             # Random permutation for this environment
@@ -578,9 +481,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             
             # Sample heights
             start_heights = torch.zeros(self.num_drones, device=self.device).uniform_(0.3, 0.6)
-            goal_heights = torch.zeros(self.num_drones, device=self.device).uniform_(
-                0.5, self.cfg.curriculum.goal_height
-            )
+            min_height = self.cfg.curriculum.goal_height_range[0]
+            max_height = self.cfg.curriculum.goal_height_range[1]
+            goal_heights = torch.zeros(self.num_drones, device=self.device).uniform_(min_height, max_height) 
             
             for j, rob in enumerate(self._robots):
                 env_id_single = env_ids[env_idx].unsqueeze(0)
@@ -611,7 +514,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 2] = goal_heights[j]
 
     ###---- Stage 2: Individual Point-to-Point ----###
-    def _set_individual_p2p_goals(self, env_ids, env_origins):
+    def _set_stage2_positions(self, env_ids, env_origins):
         """Set individual point-to-point goals for curriculum stage 2.
         
         Agents must learn to:
@@ -627,7 +530,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         # Create grid of start positions
         grid_size = int(torch.ceil(torch.sqrt(torch.tensor(self.num_drones, dtype=torch.float32))))
-        spacing = max(0.5, self.cfg.min_sep)
+        spacing = torch.zeros(1,device=self.device).uniform_(self.cfg.curriculum.spawn_grid_spacing_range[0], self.cfg.curriculum.spawn_grid_spacing_range[1])#max(0.5, self.cfg.min_sep)
         
         # Calculate height stratification to prevent collisions
         # Each drone operates on a different Z-plane
@@ -681,7 +584,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 # -----------------------------------------------------
                 # Sample distance and angle for goal
                 goal_distance = torch.zeros(1, device=self.device).uniform_(
-                    0.5, 
+                    2.0, 
                     self.cfg.curriculum.goal_xy_distance
                 ).item()
                 
@@ -710,40 +613,29 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 2] = goal_z
 
     ###---- Stage 3: Individual Point-to-Point with Obstacles ----###
-    def _set_individual_p2p_goals_with_obstacles(self, env_ids, env_origins):
-        """Set individual point-to-point goals with static wall obstacles.
+    def _set_stage3_positions(self, env_ids, env_origins):
+        """Set individual point-to-point goals with static wall obstacles at stage 3 offset.
         
-        Creates a barrier wall with gaps OFFSET from drone lanes, forcing drones to:
-        1. Detect the obstacle blocking their direct path
-        2. Search laterally for gaps between wall segments
-        3. Navigate around obstacles to reach goals behind the barrier
+        Obstacles are already built at (stage3_offset_x + 5.0, stage3_offset_y) in a HORIZONTAL barrier.
+        Agents spawn at stage3_offset, travel horizontally (along X) through gaps, reach goals behind barrier.
         
         Args:
             env_ids: Indices of environments to reset
             env_origins: Origins of environments, shape (num_reset_envs, 3)
         """
         num_reset_envs = len(env_ids)
+        offset_x, offset_y = self._get_stage_offset()  # Returns (20.0, 0.0) for stage 3
         
-        # Barrier configuration
-        obstacle_distance_from_start = 2.5  # Distance from start line to barrier
+        # Obstacle configuration (must match _build_all_obstacles)
+        obstacle_distance_from_start = 5.0  # Distance from offset to barrier
         goal_distance_behind_obstacle = 2.0  # Distance from barrier to goal
         
-        # Line formation for drones
-        line_spacing = 1.2  # Spacing between drones in line
+        # Barrier is HORIZONTAL at x = offset_x + 5.0
+        barrier_x = offset_x + obstacle_distance_from_start
+        
+        # Line formation for drones (HORIZONTAL line, traveling along +X axis)
+        line_spacing = 1.0  # Spacing between drones in line
         base_height = 0.8   # Height for all drones
-        
-        # Wall segment dimensions
-        wall_thickness = 0.2        # Thin wall (20cm)
-        wall_segment_length = 0.9   # Length of each wall piece (covers most of lane)
-        wall_height = 2.5           # Tall enough to block drones
-        gap_width = 0.3             # Small gap between segments (forces maneuvering)
-        
-        # KEY: Offset gaps from drone lanes
-        gap_offset_from_lane = line_spacing / 2.0  # Gaps are between lanes, not aligned with them
-        
-        # Initialize obstacle positions storage
-        if not hasattr(self, '_obstacle_positions'):
-            self._obstacle_positions = {}
         
         for env_idx in range(num_reset_envs):
             env_id_int = env_ids[env_idx].item()
@@ -751,66 +643,18 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             # Random permutation for line positions
             perm = torch.randperm(self.num_drones, device=self.device)
             
-            # Decide formation orientation (50% horizontal, 50% vertical)
-            horizontal_line = torch.rand(1, device=self.device).item() > 0.5
-            
-            # Calculate barrier center position
-            if horizontal_line:
-                barrier_x = env_origins[env_idx, 0] + obstacle_distance_from_start
-                barrier_y_center = env_origins[env_idx, 1]
-            else:
-                barrier_x_center = env_origins[env_idx, 0]
-                barrier_y = env_origins[env_idx, 1] + obstacle_distance_from_start
-            
-            # Create wall segments positioned to BLOCK each drone lane
-            # Gaps will be BETWEEN lanes (offset from drone paths)
-            num_wall_segments = self.num_drones
-            
-            for seg_idx in range(num_wall_segments):
-                if horizontal_line:
-                    # Horizontal barrier: walls extend in Y direction
-                    # Position walls to BLOCK each drone's lane
-                    drone_lane_offset = (seg_idx - (self.num_drones - 1) / 2.0) * line_spacing
-                    wall_x = barrier_x
-                    wall_y = barrier_y_center + drone_lane_offset  # Centered on drone lane
-                    wall_z = wall_height / 2.0
-                    
-                    # Wall oriented perpendicular to drone path (blocks the lane)
-                    wall_size = (wall_thickness, wall_segment_length, wall_height)
-                else:
-                    # Vertical barrier: walls extend in X direction
-                    drone_lane_offset = (seg_idx - (self.num_drones - 1) / 2.0) * line_spacing
-                    wall_x = barrier_x_center + drone_lane_offset  # Centered on drone lane
-                    wall_y = barrier_y
-                    wall_z = wall_height / 2.0
-                    
-                    # Wall oriented perpendicular to drone path
-                    wall_size = (wall_segment_length, wall_thickness, wall_height)
-                
-                # Store wall position and size
-                wall_key = (env_id_int, seg_idx)
-                self._obstacle_positions[wall_key] = {
-                    'position': (wall_x, wall_y, wall_z),
-                    'size': wall_size,
-                    'orientation': 'horizontal' if horizontal_line else 'vertical'
-                }
-            
-            # Now set drone start and goal positions
+            # Set drone start and goal positions
             for j, rob in enumerate(self._robots):
                 env_id_single = env_ids[env_idx].unsqueeze(0)
                 
                 # -----------------------------------------------------
-                # DRONE START POSITION: Line formation
+                # DRONE START POSITION: Horizontal line at stage offset
                 # -----------------------------------------------------
                 line_position = perm[j].item()
                 
-                if horizontal_line:
-                    start_x = env_origins[env_idx, 0]
-                    start_y = env_origins[env_idx, 1] + (line_position - (self.num_drones - 1) / 2.0) * line_spacing
-                else:
-                    start_x = env_origins[env_idx, 0] + (line_position - (self.num_drones - 1) / 2.0) * line_spacing
-                    start_y = env_origins[env_idx, 1]
-                
+                # Start position: line extending in Y direction at offset_x
+                start_x = env_origins[env_idx, 0] + offset_x
+                start_y = env_origins[env_idx, 1] + offset_y + (line_position - (self.num_drones - 1) / 2.0) * line_spacing
                 start_z = base_height
                 
                 # Reset robot
@@ -827,29 +671,33 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
                 
                 # -----------------------------------------------------
-                # GOAL POSITION: Straight ahead through neighbor's gap
+                # GOAL POSITION: Behind barrier, aligned with start Y (BLOCKED)
                 # -----------------------------------------------------
-                # Goal is directly behind the wall, aligned with start position
-                # Drone MUST move laterally to find gap before proceeding
+                # Goal is straight ahead (same Y coordinate as start)
+                # Drone must move laterally (change Y) to find gap between wall segments
                 
-                if horizontal_line:
-                    goal_x = start_x + obstacle_distance_from_start + goal_distance_behind_obstacle
-                    goal_y = start_y  # Aligned with start Y (BLOCKED by wall)
-                else:
-                    goal_x = start_x  # Aligned with start X (BLOCKED by wall)
-                    goal_y = start_y + obstacle_distance_from_start + goal_distance_behind_obstacle
-                
+                goal_x = env_origins[env_idx, 0] + offset_x + obstacle_distance_from_start + goal_distance_behind_obstacle
+                goal_y = start_y  # Aligned with start Y (blocked by wall)
                 goal_z = start_z + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
                 
                 self._desired_pos_w[env_id_single, j, 0] = goal_x
                 self._desired_pos_w[env_id_single, j, 1] = goal_y
                 self._desired_pos_w[env_id_single, j, 2] = goal_z
-
-    def _ensure_obstacles_built(self):
-        """Create cuboid wall obstacle prims."""
-        if self._obstacles_built:
-            return
         
+        print(f"[Stage 3] Agents spawn at ({offset_x}, {offset_y}), barrier at x={barrier_x}, goals at x={barrier_x + goal_distance_behind_obstacle}")
+        
+    ##-- Build all the obstacle prims and its called in _setup_scene --##
+    def _build_all_obstacles(self):
+        """Build all obstacle prims at fixed locations for stages 3 and 5.
+        
+        Stage 3: HORIZONTAL barrier at (stage3_offset_x + 5.0, stage3_offset_y)
+                - Walls extend in Y direction
+                - Agents travel along +X axis
+        
+        Stage 5: VERTICAL barrier at (stage5_offset_x, stage5_offset_y + 5.0)
+                - Walls extend in X direction
+                - Agents travel along +Y axis
+        """
         from isaaclab.sim.spawners.shapes import CuboidCfg
         from isaaclab.sim.schemas.schemas_cfg import (
             RigidBodyPropertiesCfg,
@@ -857,76 +705,76 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         )
         from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
         
-        # Create wall segments for each environment
-        max_wall_segments = self.num_drones  # One wall per drone (blocks each lane)
+        max_wall_segments = self.num_drones
         
-        for env_idx in range(self.num_envs):
-            for seg_idx in range(max_wall_segments):
-                wall_path = f"/World/envs/env_{env_idx}/WallSegment_{seg_idx}"
-                
-                # Default wall configuration (will be resized in _randomize_obstacles)
-                wall_cfg = CuboidCfg(
-                    size=(0.2, 0.9, 2.5),  # Default size
-                    rigid_props=RigidBodyPropertiesCfg(
-                        rigid_body_enabled=True,
-                        kinematic_enabled=True,
-                        disable_gravity=True,
-                    ),
-                    collision_props=CollisionPropertiesCfg(
-                        collision_enabled=True,
-                    ),
-                    visual_material=PreviewSurfaceCfg(
-                        diffuse_color=(0.9, 0.1, 0.1),  # Red
-                        roughness=0.4,
-                        metallic=0.0,
-                    ),
-                )
-                
-                # Spawn at origin (will be repositioned)
-                wall_cfg.func(wall_path, wall_cfg, translation=(0.0, 0.0, 0.0))
+        # Different sizes for different stages
+        obstacle_configs = {
+            "stage3": (0.2, 0.9, 2.5),  # (thickness, length, height) for horizontal barrier
+            "stage5": (1.2, 0.2, 2.5),  # (length, thickness, height) for vertical barrier
+        }
+        
+        source_env_idx = 0
+        barrier_distance = 5.0
+        
+        # Stage 3 obstacles: HORIZONTAL barrier (walls perpendicular to X-axis travel)
+        stage3_offset = (self.cfg.curriculum.stage3_offset_x, self.cfg.curriculum.stage3_offset_y, 0.0)
+        
+        for seg_idx in range(max_wall_segments):
+            # Horizontal barrier: walls extend in Y direction, block X-axis travel
+            wall_x = stage3_offset[0] + barrier_distance
+            wall_y = stage3_offset[1] + (seg_idx - (max_wall_segments - 1) / 2.0) * 1.0
+            wall_z = 1.25
+            
+            wall_path_s3 = f"/World/envs/env_{source_env_idx}/WallSegment_Stage3_{seg_idx}"
+            wall_cfg_s3 = CuboidCfg(
+                size=obstacle_configs["stage3"],
+                rigid_props=RigidBodyPropertiesCfg(
+                    rigid_body_enabled=True,
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                collision_props=CollisionPropertiesCfg(collision_enabled=True),
+                visual_material=PreviewSurfaceCfg(
+                    diffuse_color=(0.9, 0.1, 0.1),
+                    roughness=0.4,
+                    metallic=0.0,
+                ),
+            )
+            wall_cfg_s3.func(wall_path_s3, wall_cfg_s3, translation=(wall_x, wall_y, wall_z))
+            
+            # Stage 5 obstacles: VERTICAL barrier (walls perpendicular to Y-axis travel)
+            stage5_offset = (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y, 0.0)
+            
+            # Vertical barrier: walls extend in X direction, block Y-axis travel
+            wall_x = stage5_offset[0] + (seg_idx - (max_wall_segments - 1) / 2.0) * 1.2
+            wall_y = stage5_offset[1] + barrier_distance
+            wall_z = 1.25
+            
+            wall_path_s5 = f"/World/envs/env_{source_env_idx}/WallSegment_Stage5_{seg_idx}"
+            wall_cfg_s5 = CuboidCfg(
+                size=obstacle_configs["stage5"],
+                rigid_props=RigidBodyPropertiesCfg(
+                    rigid_body_enabled=True,
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                collision_props=CollisionPropertiesCfg(collision_enabled=True),
+                visual_material=PreviewSurfaceCfg(
+                    diffuse_color=(0.9, 0.1, 0.1),
+                    roughness=0.4,
+                    metallic=0.0,
+                ),
+            )
+            wall_cfg_s5.func(wall_path_s5, wall_cfg_s5, translation=(wall_x, wall_y, wall_z))
         
         self._obstacles_built = True
-        print(f"[INFO] Built {max_wall_segments} wall segments per environment")
-
-    def _randomize_obstacles(self, env_ids, env_origins):
-        """Position and resize wall segments based on stored configurations."""
-        if not hasattr(self, '_obstacle_positions') or not self._obstacle_positions:
-            return
+        print(f"[INFO] Pre-built {max_wall_segments * 2} obstacles:")
+        print(f"  Stage 3: Horizontal barrier at ({stage3_offset[0] + barrier_distance}, {stage3_offset[1]})")
+        print(f"  Stage 5: Vertical barrier at ({stage5_offset[0]}, {stage5_offset[1] + barrier_distance})")
         
-        import omni.isaac.core.utils.prims as prim_utils
-        from pxr import UsdGeom, Gf
-        
-        for env_idx_in_batch, env_id in enumerate(env_ids):
-            env_id_int = env_id.item()
-            max_wall_segments = self.num_drones
-            
-            for seg_idx in range(max_wall_segments):
-                wall_path = f"/World/envs/env_{env_id_int}/WallSegment_{seg_idx}"
-                wall_key = (env_id_int, seg_idx)
-                
-                if wall_key in self._obstacle_positions and prim_utils.is_prim_path_valid(wall_path):
-                    wall_data = self._obstacle_positions[wall_key]
-                    pos = wall_data['position']
-                    size = wall_data['size']
-                    
-                    # Get the wall prim
-                    wall_prim = prim_utils.get_prim_at_path(wall_path)
-                    xformable = UsdGeom.Xformable(wall_prim)
-                    
-                    # Set position
-                    xformable.ClearXformOpOrder()
-                    translate_op = xformable.AddTranslateOp()
-                    translate_op.Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
-                    
-                    # Update cube size (scale)
-                    cube = UsdGeom.Cube(wall_prim)
-                    if cube:
-                        scale_op = xformable.AddScaleOp()
-                        scale_op.Set(Gf.Vec3d(float(size[0]), float(size[1]), float(size[2])))
-
-
     ###---- Stage 4: Swarm Navigation ----###
-    def _set_swarm_navigation_goals(self, env_ids, env_origins):
+
+    def _set_stage4_positions(self, env_ids, env_origins):
         """Set swarm navigation goals with formation aligned to travel direction."""
         num_reset_envs = len(env_ids)
         
@@ -990,6 +838,100 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 1] = goal_y
                 self._desired_pos_w[env_id_single, j, 2] = goal_z
 
+    ###---- Stage 5: Swarm Navigation with Obstacles ----###
+    def _set_stage5_positions(self, env_ids, env_origins):
+        """Set swarm navigation goals with obstacles at stage 5 offset.
+        
+        Obstacles are already built at (stage5_offset_x, stage5_offset_y + 5.0) in a VERTICAL barrier.
+        Swarm spawns at stage5_offset, travels vertically (along Y) through gaps, maintains formation.
+        
+        Args:
+            env_ids: Indices of environments to reset
+            env_origins: Origins of environments, shape (num_reset_envs, 3)
+        """
+        num_reset_envs = len(env_ids)
+        offset_x, offset_y = self._get_stage_offset()  # Returns (0.0, 20.0) for stage 5
+        
+        # Sample spawn heights
+        spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
+            self.cfg.curriculum.spawn_height_range[0], 
+            self.cfg.curriculum.spawn_height_range[1]
+        )
+        
+        # -----------------------------------------------------
+        # 1. START POSITIONS: Inverted V formation at stage offset
+        # -----------------------------------------------------
+        # Adjust env_origins to include stage offset
+        offset_origins = env_origins.clone()
+        offset_origins[:, 0] += offset_x
+        offset_origins[:, 1] += offset_y
+        
+        formation_positions = self.get_inverted_v_formation(env_ids, offset_origins, spawn_heights)
+        
+        # Reset robots with formation positions
+        for j, rob in enumerate(self._robots):
+            joint_pos = rob.data.default_joint_pos[env_ids]
+            joint_vel = rob.data.default_joint_vel[env_ids]
+            default_root_state = rob.data.default_root_state[env_ids].clone()
+            default_root_state[:, :3] = formation_positions[:, j, :]
+            
+            rob.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+            rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+            rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+        
+        # -----------------------------------------------------
+        # 2. GOAL POSITIONS: Travel along +Y axis (toward barrier)
+        # -----------------------------------------------------
+        # Barrier is VERTICAL at y = offset_y + 5.0
+        # Swarm travels from offset_y toward barrier and beyond
+        
+        obstacle_distance_from_start = 5.0  # Distance to barrier
+        min_travel_distance = obstacle_distance_from_start + 2.0  # Must go past barrier
+        max_travel_distance = obstacle_distance_from_start + 10.0  # Maximum travel
+        
+        for env_idx in range(num_reset_envs):
+            env_id_single = env_ids[env_idx]
+            
+            # Sample translation distance (always along +Y axis for stage 5)
+            translation_distance = torch.zeros(1, device=self.device).uniform_(
+                min_travel_distance,
+                max_travel_distance
+            ).item()
+            
+            # Fixed angle: travel along +Y axis (90 degrees)
+            translation_angle = torch.pi / 2.0  # 90 degrees (upward in Y)
+            
+            translation_x = translation_distance * torch.cos(torch.tensor(translation_angle, device=self.device))
+            translation_y = translation_distance * torch.sin(torch.tensor(translation_angle, device=self.device))
+            
+            # Align V-formation to point toward goal (upward in Y)
+            rotation_angle = translation_angle
+            
+            cos_theta = torch.cos(torch.tensor(rotation_angle, device=self.device))
+            sin_theta = torch.sin(torch.tensor(rotation_angle, device=self.device))
+            
+            formation_center = formation_positions[env_idx].mean(dim=0)
+            
+            # Set goal positions for each drone
+            for j in range(self.num_drones):
+                start_pos = formation_positions[env_idx, j]
+                relative_pos = start_pos[:2] - formation_center[:2]
+                
+                # Rotate relative position to align with travel direction
+                rotated_x = cos_theta * relative_pos[0] - sin_theta * relative_pos[1]
+                rotated_y = sin_theta * relative_pos[0] + cos_theta * relative_pos[1]
+                
+                # Translate to goal
+                goal_x = formation_center[0] + translation_x + rotated_x
+                goal_y = formation_center[1] + translation_y + rotated_y
+                goal_z = start_pos[2] + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+                
+                self._desired_pos_w[env_id_single, j, 0] = goal_x
+                self._desired_pos_w[env_id_single, j, 1] = goal_y
+                self._desired_pos_w[env_id_single, j, 2] = goal_z
+        
+        barrier_y = offset_y + obstacle_distance_from_start
+        print(f"[Stage 5] Swarm spawns at ({offset_x}, {offset_y}), barrier at y={barrier_y}, travels along +Y axis")
 ###---- Formation Helper Method: Inverted V Formation ----###
 
     def get_inverted_v_formation(self, env_ids: torch.Tensor, env_origins: torch.Tensor, spawn_heights: torch.Tensor) -> torch.Tensor:
@@ -1076,3 +1018,19 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         formation_positions[:, :, 2] += spawn_heights.unsqueeze(1)
         
         return formation_positions  # Shape: (num_reset_envs, num_drones, 3)
+    
+    def _get_stage_offset(self) -> tuple[float, float]:
+        """Get the XY offset for the current curriculum stage.
+        
+        Returns:
+            Tuple of (offset_x, offset_y) for the current stage
+        """
+        stage = self.curriculum_stage
+        
+        if stage == 3:
+            return (self.cfg.curriculum.stage3_offset_x, self.cfg.curriculum.stage3_offset_y)
+        elif stage == 5:
+            return (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y)
+        else:
+            # Stages 1, 2, 4: use default origin (0, 0)
+            return (0.0, 0.0)
