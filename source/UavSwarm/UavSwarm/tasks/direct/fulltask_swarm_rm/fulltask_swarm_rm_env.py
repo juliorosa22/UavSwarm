@@ -54,8 +54,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     def __init__(self, cfg: FullTaskUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
         
         self.num_drones = cfg.num_agents        
-        self.global_step=3_999_990
-        self.curriculum_stage=2
+        self.global_step=7_999_990
+        self.curriculum_stage=4
         self._obstacles_built=False
         # Initialize lists (before parent __init__)
         self._robots = []
@@ -101,9 +101,27 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         self._current_waypoint_idx = torch.zeros(
             self.num_envs, self.num_drones, dtype=torch.long, device=self.device
         )
+
+        # -----------------------------------------------------
+        # STAGE 5: Swarm waypoint buffers (shared across swarm)
+        # -----------------------------------------------------
+        self.num_swarm_waypoints = 3  # 3 waypoints through stacked X pattern
+        
+        # Swarm waypoint paths: (num_envs, num_waypoints, 3)
+        # These are shared goals for the entire swarm (centroid targets)
+        self._swarm_waypoint_paths = torch.zeros(
+            self.num_envs, self.num_swarm_waypoints, 3,
+            device=self.device
+        )
+        
+        # Current swarm waypoint index: (num_envs,)
+        self._current_swarm_waypoint_idx = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+
         # Waypoint reached threshold (distance in meters)
         self.waypoint_reach_threshold = 0.3
-
+        self.swarm_waypoint_reach_threshold = 0.5  # Slightly larger for swarm centroid
 
         # Debug visualization
         self.set_debug_vis(self.cfg.debug_vis)
@@ -154,6 +172,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Update waypoint goals for stage 3
         if self.curriculum_stage == 3:
             self._update_waypoint_goals()
+        elif self.curriculum_stage == 5:
+            self._update_swarm_waypoint_goals()
+
         # Convert dictionary to stacked tensor: (num_envs, num_drones, 4)
         actions_list = []
         for i in range(self.num_drones):
@@ -168,6 +189,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             thrust_cmd = (self._actions[:, j, 0] + 1.0) / 2.0  # [0, 1]
             self._thrust[:, j, 0, 2] = self.cfg.thrust_to_weight * self._robot_weights[j] * thrust_cmd
             self._moment[:, j, 0, :] = self.cfg.moment_scale * self._actions[:, j, 1:]
+
 
     def _apply_action(self):
         """Apply forces and torques to each robot."""
@@ -524,6 +546,57 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                         self._current_waypoint_idx[env_idx, agent_idx] = self.num_waypoints_per_agent
                         print(f"[Stage 3] Env {env_idx}, Agent {agent_idx}: Completed all waypoints!")
     
+    def _update_swarm_waypoint_goals(self):
+        """Update swarm goals based on centroid progress through waypoint path (Stage 5).
+        
+        When the swarm centroid reaches a waypoint, advance all agents to the next waypoint
+        while maintaining their formation relative to the new target.
+        """
+        for env_idx in range(self.num_envs):
+            # Get current waypoint index for this environment
+            current_wp_idx = self._current_swarm_waypoint_idx[env_idx].item()
+            
+            # Check if swarm has completed all waypoints
+            if current_wp_idx >= self.num_swarm_waypoints:
+                continue  # Already at final waypoint
+            
+            # Calculate swarm centroid position
+            swarm_positions = torch.stack([rob.data.root_pos_w[env_idx] for rob in self._robots], dim=0)  # (num_drones, 3)
+            swarm_centroid = swarm_positions.mean(dim=0)  # (3,)
+            
+            # Get current waypoint target
+            current_waypoint = self._swarm_waypoint_paths[env_idx, current_wp_idx]  # (3,)
+            
+            # Calculate distance from centroid to waypoint
+            distance_to_waypoint = torch.linalg.norm(swarm_centroid - current_waypoint).item()
+            
+            # Check if waypoint is reached
+            if distance_to_waypoint < self.swarm_waypoint_reach_threshold:
+                # Advance to next waypoint
+                next_wp_idx = current_wp_idx + 1
+                
+                if next_wp_idx < self.num_swarm_waypoints:
+                    # Update to next waypoint
+                    self._current_swarm_waypoint_idx[env_idx] = next_wp_idx
+                    next_waypoint = self._swarm_waypoint_paths[env_idx, next_wp_idx]  # (3,)
+                    
+                    # Calculate formation offsets relative to current centroid
+                    formation_offsets = swarm_positions - swarm_centroid.unsqueeze(0)  # (num_drones, 3)
+                    
+                    # Update each agent's goal to maintain formation around new waypoint
+                    for j in range(self.num_drones):
+                        goal_pos = next_waypoint + formation_offsets[j]
+                        
+                        self._desired_pos_w[env_idx, j, 0] = goal_pos[0]
+                        self._desired_pos_w[env_idx, j, 1] = goal_pos[1]
+                        self._desired_pos_w[env_idx, j, 2] = goal_pos[2]
+                    
+                    print(f"[Stage 5] Env {env_idx}: Swarm reached waypoint {current_wp_idx}, advancing to {next_wp_idx}")
+                else:
+                    # Mark as completed
+                    self._current_swarm_waypoint_idx[env_idx] = self.num_swarm_waypoints
+                    print(f"[Stage 5] Env {env_idx}: Swarm completed all waypoints!")
+
     ###---- Stage 1: Individual Hover ----###
     def _set_stage1_positions(self, env_ids, env_origins):
         """Set hover goals - simplified grid version."""
@@ -540,8 +613,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             
             # Sample heights
             start_heights = torch.zeros(self.num_drones, device=self.device).uniform_(0.3, 0.6)
-            min_height = self.cfg.curriculum.goal_height_range[0]
-            max_height = self.cfg.curriculum.goal_height_range[1]
+            min_height = self.cfg.curriculum.stage1_goal_height_range[0]
+            max_height = self.cfg.curriculum.stage1_goal_height_range[1]
             goal_heights = torch.zeros(self.num_drones, device=self.device).uniform_(min_height, max_height) 
             
             for j, rob in enumerate(self._robots):
@@ -593,7 +666,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         # Calculate height stratification to prevent collisions
         # Each drone operates on a different Z-plane
-        z_spacing = self.cfg.curriculum.z_distance_xy_plane
+        z_spacing = self.cfg.curriculum.stage2_zdist_xy_plane
         base_height = 0.5  # Minimum start height
         
         for env_idx in range(num_reset_envs):
@@ -644,7 +717,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 # Sample distance and angle for goal
                 goal_distance = torch.zeros(1, device=self.device).uniform_(
                     2.0, 
-                    self.cfg.curriculum.goal_xy_distance
+                    self.cfg.curriculum.stage2_goal_distance
                 ).item()
                 
                 # Random angle in [0, 2π] to encourage yaw rotation
@@ -844,7 +917,14 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         print(f"  - Zig-zag pattern with {obstacle_spacing_x}m spacing")
 
     def _build_stage5_obstacles(self):
-        """Build stage 5 vertical barrier obstacles for swarm navigation."""
+        """Build stage 5 obstacles in stacked X pattern.
+        
+        Creates 8 wall segments arranged in two X shapes stacked vertically:
+        - Bottom X: 3 walls (left, center, right)
+        - Top X: 5 walls (full X pattern)
+        
+        This forces swarm to navigate through strategic gaps while maintaining formation.
+        """
         from isaaclab.sim.spawners.shapes import CuboidCfg
         from isaaclab.sim.schemas.schemas_cfg import (
             RigidBodyPropertiesCfg,
@@ -854,19 +934,48 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         stage5_offset = (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y, 0.0)
         source_env_idx = 0
-        barrier_distance = 5.0
         
-        max_wall_segments = self.num_drones
-        obstacle_size = (1.2, 0.2, 2.5)  # (length, thickness, height) for vertical barrier
+        # Get offset configuration
+        x_offset = self.cfg.curriculum.stage5_obsx_offset  # 2.0m
+        y_offset = self.cfg.curriculum.stage5_obsy_offset  # 3.0m
         
-        for seg_idx in range(max_wall_segments):
-            # Vertical barrier: walls extend in X direction, block Y-axis travel
-            wall_x = stage5_offset[0] + (seg_idx - (max_wall_segments - 1) / 2.0) * 1.2
-            wall_y = stage5_offset[1] + barrier_distance
-            wall_z = 1.25
+        # Obstacle size: vertical walls blocking Y-axis travel
+        obstacle_size = (1.2, 0.2, 2.5)  # (length, thickness, height)
+        base_height = 1.25
+        dist_from_spawn_swarm = 0  # Distance from swarm spawn area to obstacle pattern
+        # Base Y position for the pattern
+        base_y = stage5_offset[1]+dist_from_spawn_swarm
+        base_x = stage5_offset[0]
+        
+        # Calculate wall positions based on stacked X pattern
+        # Pattern layout (Y increases upward):
+        #
+        #     wall7        wall8         (Y = base + 2*y_offset)
+        #           wall6               (Y = base + 1.5*y_offset) - center top X
+        #     wall4        wall5         (Y = base + y_offset)
+        #           wall3               (Y = base + 0.5*y_offset) - center bottom X
+        #     wall1  wall2               (Y = base)
+        
+        wall_positions = [
+            # Bottom X base (3 walls)
+            (base_x - x_offset, base_y, base_height),              # wall1 - left bottom
+            (base_x + x_offset, base_y, base_height),              # wall2 - right bottom
+            (base_x, base_y + 0.5 * y_offset, base_height),        # wall3 - center bottom
             
-            wall_path_s5 = f"/World/envs/env_{source_env_idx}/WallSegment_Stage5_{seg_idx}"
-            wall_cfg_s5 = CuboidCfg(
+            # Middle layer (2 walls)
+            (base_x - x_offset, base_y + y_offset, base_height),   # wall4 - left middle
+            (base_x + x_offset, base_y + y_offset, base_height),   # wall5 - right middle
+            
+            # Top X (3 walls)
+            (base_x, base_y + 1.5 * y_offset, base_height),        # wall6 - center top
+            (base_x - x_offset, base_y + 2 * y_offset, base_height), # wall7 - left top
+            (base_x + x_offset, base_y + 2 * y_offset, base_height), # wall8 - right top
+        ]
+        
+        # Build all 8 wall segments
+        for wall_idx, (wall_x, wall_y, wall_z) in enumerate(wall_positions):
+            wall_path = f"/World/envs/env_{source_env_idx}/WallSegment_Stage5_{wall_idx}"
+            wall_cfg = CuboidCfg(
                 size=obstacle_size,
                 rigid_props=RigidBodyPropertiesCfg(
                     rigid_body_enabled=True,
@@ -880,21 +989,22 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                     metallic=0.0,
                 ),
             )
-            wall_cfg_s5.func(wall_path_s5, wall_cfg_s5, translation=(wall_x, wall_y, wall_z))
+            wall_cfg.func(wall_path, wall_cfg, translation=(wall_x, wall_y, wall_z))
         
-        print(f"[INFO] Built Stage 5 vertical barrier:")
-        print(f"  - {max_wall_segments} wall segments at y={stage5_offset[1] + barrier_distance}")
-
+        print(f"[INFO] Built Stage 5 stacked X obstacle pattern:")
+        print(f"  - 8 wall segments in X formation")
+        print(f"  - X offset: {x_offset}m, Y offset: {y_offset}m")
+        print(f"  - Base position: ({base_x}, {base_y})")
     
     ###---- Stage 4: Swarm Navigation ----###
-
+    #TODO adjust this stage to also use the swarm centroid waypoint logic
     def _set_stage4_positions(self, env_ids, env_origins):
         """Set swarm navigation goals with formation aligned to travel direction."""
         num_reset_envs = len(env_ids)
         
         spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
-            self.cfg.spawn_height_range[0], 
-            self.cfg.spawn_height_range[1]
+            self.cfg.curriculum.spawn_height_range[0], 
+            self.cfg.curriculum.spawn_height_range[1]
         )
         
         # Start positions: Inverted V formation
@@ -953,11 +1063,14 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 2] = goal_z
 
     ###---- Stage 5: Swarm Navigation with Obstacles ----###
+    
     def _set_stage5_positions(self, env_ids, env_origins):
-        """Set swarm navigation goals with obstacles at stage 5 offset.
+        """Set swarm waypoint navigation through stacked X obstacle pattern.
         
-        Obstacles are already built at (stage5_offset_x, stage5_offset_y + 5.0) in a VERTICAL barrier.
-        Swarm spawns at stage5_offset, travels vertically (along Y) through gaps, maintains formation.
+        Swarm navigates through 3 waypoints placed at the centers of the X pattern gaps:
+        - Waypoint 1: Center of bottom X (between wall1, wall2, wall3)
+        - Waypoint 2: Center of middle gap (between wall4, wall5, wall6)
+        - Waypoint 3: Center of top X (between wall6, wall7, wall8)
         
         Args:
             env_ids: Indices of environments to reset
@@ -965,6 +1078,10 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         """
         num_reset_envs = len(env_ids)
         offset_x, offset_y = self._get_stage_offset()  # Returns (0.0, 20.0) for stage 5
+        
+        # Get obstacle configuration
+        x_offset = self.cfg.curriculum.stage5_obsx_offset
+        y_offset = self.cfg.curriculum.stage5_obsy_offset
         
         # Sample spawn heights
         spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
@@ -975,7 +1092,6 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # -----------------------------------------------------
         # 1. START POSITIONS: Inverted V formation at stage offset
         # -----------------------------------------------------
-        # Adjust env_origins to include stage offset
         offset_origins = env_origins.clone()
         offset_origins[:, 0] += offset_x
         offset_origins[:, 1] += offset_y
@@ -994,58 +1110,71 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
         
         # -----------------------------------------------------
-        # 2. GOAL POSITIONS: Travel along +Y axis (toward barrier)
+        # 2. SWARM WAYPOINT PATHS (3 waypoints through X pattern)
         # -----------------------------------------------------
-        # Barrier is VERTICAL at y = offset_y + 5.0
-        # Swarm travels from offset_y toward barrier and beyond
+        for env_idx in range(num_reset_envs):
+            env_id_int = env_ids[env_idx].item()
+            
+            base_height = spawn_heights[env_idx].item()
+            
+            # Waypoint 1: Gap in bottom X (between wall3 and wall4/5)
+            wp1_x = env_origins[env_idx, 0] + offset_x
+            wp1_y = env_origins[env_idx, 1] + offset_y + 0.75 * y_offset  # Between center and middle
+            wp1_z = base_height + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+            
+            self._swarm_waypoint_paths[env_id_int, 0, 0] = wp1_x
+            self._swarm_waypoint_paths[env_id_int, 0, 1] = wp1_y
+            self._swarm_waypoint_paths[env_id_int, 0, 2] = wp1_z
+            
+            # Waypoint 2: Gap in middle (between wall4/5 and wall6)
+            wp2_x = env_origins[env_idx, 0] + offset_x
+            wp2_y = env_origins[env_idx, 1] + offset_y + 1.25 * y_offset  # Between middle and center top
+            wp2_z = base_height + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+            
+            self._swarm_waypoint_paths[env_id_int, 1, 0] = wp2_x
+            self._swarm_waypoint_paths[env_id_int, 1, 1] = wp2_y
+            self._swarm_waypoint_paths[env_id_int, 1, 2] = wp2_z
+            
+            # Waypoint 3: Final position beyond top X
+            wp3_x = env_origins[env_idx, 0] + offset_x
+            wp3_y = env_origins[env_idx, 1] + offset_y + 2.5 * y_offset  # Beyond wall7/8
+            wp3_z = base_height + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+            
+            self._swarm_waypoint_paths[env_id_int, 2, 0] = wp3_x
+            self._swarm_waypoint_paths[env_id_int, 2, 1] = wp3_y
+            self._swarm_waypoint_paths[env_id_int, 2, 2] = wp3_z
+            
+            # Reset current waypoint index
+            self._current_swarm_waypoint_idx[env_id_int] = 0
         
-        obstacle_distance_from_start = 5.0  # Distance to barrier
-        min_travel_distance = obstacle_distance_from_start + 2.0  # Must go past barrier
-        max_travel_distance = obstacle_distance_from_start + 10.0  # Maximum travel
-        
+        # -----------------------------------------------------
+        # 3. SET INITIAL GOALS (formation around first waypoint)
+        # -----------------------------------------------------
         for env_idx in range(num_reset_envs):
             env_id_single = env_ids[env_idx]
+            env_id_int = env_id_single.item()
             
-            # Sample translation distance (always along +Y axis for stage 5)
-            translation_distance = torch.zeros(1, device=self.device).uniform_(
-                min_travel_distance,
-                max_travel_distance
-            ).item()
+            # Get first waypoint (swarm centroid target)
+            swarm_target = self._swarm_waypoint_paths[env_id_int, 0, :]  # (3,)
             
-            # Fixed angle: travel along +Y axis (90 degrees)
-            translation_angle = torch.pi / 2.0  # 90 degrees (upward in Y)
+            # Calculate formation center
+            formation_center = formation_positions[env_idx].mean(dim=0)  # (3,)
             
-            translation_x = translation_distance * torch.cos(torch.tensor(translation_angle, device=self.device))
-            translation_y = translation_distance * torch.sin(torch.tensor(translation_angle, device=self.device))
-            
-            # Align V-formation to point toward goal (upward in Y)
-            rotation_angle = translation_angle
-            
-            cos_theta = torch.cos(torch.tensor(rotation_angle, device=self.device))
-            sin_theta = torch.sin(torch.tensor(rotation_angle, device=self.device))
-            
-            formation_center = formation_positions[env_idx].mean(dim=0)
-            
-            # Set goal positions for each drone
+            # Set individual goals to maintain formation relative to swarm target
             for j in range(self.num_drones):
                 start_pos = formation_positions[env_idx, j]
-                relative_pos = start_pos[:2] - formation_center[:2]
+                relative_pos = start_pos - formation_center
                 
-                # Rotate relative position to align with travel direction
-                rotated_x = cos_theta * relative_pos[0] - sin_theta * relative_pos[1]
-                rotated_y = sin_theta * relative_pos[0] + cos_theta * relative_pos[1]
+                # Goal = swarm_target + formation_offset
+                goal_pos = swarm_target + relative_pos
                 
-                # Translate to goal
-                goal_x = formation_center[0] + translation_x + rotated_x
-                goal_y = formation_center[1] + translation_y + rotated_y
-                goal_z = start_pos[2] + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
-                
-                self._desired_pos_w[env_id_single, j, 0] = goal_x
-                self._desired_pos_w[env_id_single, j, 1] = goal_y
-                self._desired_pos_w[env_id_single, j, 2] = goal_z
+                self._desired_pos_w[env_id_single, j, 0] = goal_pos[0]
+                self._desired_pos_w[env_id_single, j, 1] = goal_pos[1]
+                self._desired_pos_w[env_id_single, j, 2] = goal_pos[2]
         
-        barrier_y = offset_y + obstacle_distance_from_start
-        print(f"[Stage 5] Swarm spawns at ({offset_x}, {offset_y}), barrier at y={barrier_y}, travels along +Y axis")
+        print(f"[Stage 5] Initialized swarm obstacle navigation with {self.num_swarm_waypoints} waypoints")
+
+
 ###---- Formation Helper Method: Inverted V Formation ----###
 
     def get_inverted_v_formation(self, env_ids: torch.Tensor, env_origins: torch.Tensor, spawn_heights: torch.Tensor) -> torch.Tensor:

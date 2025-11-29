@@ -52,26 +52,40 @@ class CurriculumCfg:
     stage3_end: int = 7_000_000   # Obstacle navigation
     stage4_end: int = 8_000_000   # Swarm navigation
     stage5_end: int = 10_000_000  # Swarm + obstacles (final)
-    
+    ##-- Separation spawan origins based on stages --
     # Stage-specific spatial offsets (where agents spawn)
     # Stages 1, 2, 4: origin at (0, 0)
     # Stage 3: origin at (stage3_offset_x, stage3_offset_y) where obstacles are
     # Stage 5: origin at (stage5_offset_x, stage5_offset_y) where obstacles are
-    stage3_offset_x: float = 20.0  # Move agents 20m in X for stage 3
+    
+
+
+    ##--- Stage 1 parameters ---##
+    stage1_goal_height_range: tuple = (1.0, 3.0)  # height range for all stages, should be below obstacle height
+
+    ##--- Stage 2 parameters ---##
+    stage2_goal_distance:float = 10.0  # xy-distance for point-to-point and obstacle navigation stages
+    stage2_zdist_xy_plane: float = 1.0  # z- distance between each agent xy-plane this will mitigate collisions during the training
+    
+   
+    ##--- Stage 3 parameters ---##
+    stage3_offset_x: float = 10.0  # Move agents 20m in X for stage 3
     stage3_offset_y: float = 0.0   # Keep Y centered
-    stage5_offset_x: float = 0.0   # Keep X centered for stage 5
-    stage5_offset_y: float = 20.0  # Move agents 20m in Y for stage 5
     
-    
-    goal_height_range: tuple = (1.0, 3.0)  # height range for all stages, should be below obstacle height
-    z_distance_xy_plane: float = 1.0  # z- distance between each agent xy-plane this will mitigate collisions during the training
-    goal_xy_distance:float = 10.0  # xy-distance for point-to-point and obstacle navigation stages
-    
+    ## --- Stage 4 parameters ---##
+
     swarm_translation_distance_min: float = 0.5  # Minimum formation translation (meters)
     swarm_translation_distance_max: float = 2.0  # Maximum formation translation (meters
-    
-    spawn_heigtht_range: tuple = (0.5, 0.8)  # spawn height range for all stages
-    spawn_grid_spacing_range: tuple = (0.5, 1.0)  # spacing range for grid spawn positions
+
+    ##--- Stage 5 parameters ---##
+    stage5_offset_x: float = -10.0   # Keep X centered for stage 5
+    stage5_offset_y: float = 0.0  # Move agents 20m in Y for stage 5
+    # Stage 5 obstacle distribution (stacked X pattern)
+    stage5_obsx_offset: float = 2.0  # X spacing between wall segments in X pattern
+    stage5_obsy_offset: float = 3.0  # Y spacing between wall segments in X pattern
+    ##--- Common parameters ---##
+    spawn_height_range: tuple = (0.5, 0.8)  # spawn height range for all stages
+    spawn_grid_spacing_range: tuple = (0.5, 1.0)  # spacing range for grid spawn positions 
 
 
 
