@@ -74,8 +74,8 @@ class CurriculumCfg:
     
     ## --- Stage 4 parameters ---##
 
-    swarm_translation_distance_min: float = 0.5  # Minimum formation translation (meters)
-    swarm_translation_distance_max: float = 2.0  # Maximum formation translation (meters
+    swarm_translation_distance_range: tuple = (2, 15)  # Minimum formation translation (meters)
+    
 
     ##--- Stage 5 parameters ---##
     stage5_offset_x: float = 0.0   # Keep X centered for stage 5

@@ -120,6 +120,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         )
 
         # Waypoint reached threshold (distance in meters)
+        self._swarm_centroid = torch.zeros(self.num_envs, 3, device=self.device)
         self.waypoint_reach_threshold = 0.3
         self.swarm_waypoint_reach_threshold = 0.5  # Slightly larger for swarm centroid
 
@@ -174,6 +175,10 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self._update_waypoint_goals()
         elif self.curriculum_stage == 5:
             self._update_swarm_waypoint_goals()
+
+         # Compute swarm centroid for stages 4 and 5 (for visualization and waypoint logic)
+        if self.curriculum_stage in [4, 5]:
+            self._compute_swarm_centroid()
 
         # Convert dictionary to stacked tensor: (num_envs, num_drones, 4)
         actions_list = []
@@ -373,28 +378,60 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     def _set_debug_vis_impl(self, debug_vis: bool):
         """Enable/disable debug visualization (matching copy_quadenv.py)."""
         if debug_vis:
+            # Import at the top of the debug_vis block so it's available everywhere
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+            from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG
+            
+            # ---------------------------------------------------------
+            # Goal position markers (yellow spheres)
+            # ---------------------------------------------------------
             if not hasattr(self, "goal_pos_visualizers"):
                 self.goal_pos_visualizers = []
                 for i in range(self.num_drones):
                     marker_cfg = SPHERE_MARKER_CFG.copy()
                     marker_cfg.markers["sphere"].radius = 0.05
-                    # Set color to green (R, G, B)
-                    marker_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 1.0, 0.0)
+                    marker_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 1.0, 0.0)  # yellow
                     marker_cfg.prim_path = f"/Visuals/Command/goal_position_{i}"
                     self.goal_pos_visualizers.append(VisualizationMarkers(marker_cfg))
             
             for viz in self.goal_pos_visualizers:
                 viz.set_visibility(True)
+
+            # ---------------------------------------------------------
+            # Swarm centroid marker (blue arrow)
+            # ---------------------------------------------------------
+            if not hasattr(self, "centroid_visualizer"):
+                centroid_marker_cfg = BLUE_ARROW_X_MARKER_CFG.copy()
+                centroid_marker_cfg.prim_path = "/Visuals/Command/swarm_centroid"
+                
+                # Optional: adjust arrow size (uncomment if needed)
+                # centroid_marker_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
+                
+                self.centroid_visualizer = VisualizationMarkers(centroid_marker_cfg)
+
+            self.centroid_visualizer.set_visibility(True)
+
+        # ------------------------------------------------------------------
+        # Disable all visualizations
+        # ------------------------------------------------------------------
         else:
             if hasattr(self, "goal_pos_visualizers"):
                 for viz in self.goal_pos_visualizers:
                     viz.set_visibility(False)
 
+            if hasattr(self, "centroid_visualizer"):
+                self.centroid_visualizer.set_visibility(False)
+                
     def _debug_vis_callback(self, event):
         """Update debug visualization markers (matching copy_quadenv.py)."""
+        # Update goal position markers
         if hasattr(self, "goal_pos_visualizers"):
             for i, viz in enumerate(self.goal_pos_visualizers):
                 viz.visualize(self._desired_pos_w[:, i, :])
+        
+        # Update swarm centroid marker (only for stages 4 and 5)
+        if hasattr(self, "centroid_visualizer") and self.curriculum_stage in [4, 5]:
+            self.centroid_visualizer.visualize(self._swarm_centroid)
     
     def _reset_idx(self, env_ids: torch.Tensor | None):
         """Reset environments with curriculum-dependent goals & scene adjustments."""
@@ -759,7 +796,17 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         print(f"  - Base position: ({base_x}, {base_y})")
     
     
-
+    def _compute_swarm_centroid(self):
+        """Compute swarm centroid position for each environment (Stages 4 & 5).
+        
+        Calculates the mean position of all drones in each environment.
+        Updates the _swarm_centroid buffer: (num_envs, 3)
+        """
+        # Stack all drone positions: (num_envs, num_drones, 3)
+        swarm_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=1)
+        
+        # Compute centroid as mean across all drones: (num_envs, 3)
+        self._swarm_centroid = swarm_positions.mean(dim=1)
 
 
     ###---- Stage 1: Individual Hover ----###
@@ -1031,8 +1078,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             
             # Sample translation
             translation_distance = torch.zeros(1, device=self.device).uniform_(
-                self.cfg.curriculum.swarm_translation_distance_min,
-                self.cfg.curriculum.swarm_translation_distance_max
+                self.cfg.curriculum.swarm_translation_distance_range[0],
+                self.cfg.curriculum.swarm_translation_distance_range[1]
             ).item()
             
             translation_angle = torch.zeros(1, device=self.device).uniform_(0.0, 2.0 * torch.pi).item()
