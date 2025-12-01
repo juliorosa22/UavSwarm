@@ -44,14 +44,14 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 @configclass
 class CurriculumCfg:
     # total training horizon (for reference)
-    total_steps: int = 10_000_000
+    total_steps: int = 10000
 
     # boundaries between stages (in environment steps)
-    stage1_end: int = 1_000_000   # Hovering
-    stage2_end: int = 4_000_000   # Point-to-point
-    stage3_end: int = 7_000_000   # Obstacle navigation
-    stage4_end: int = 8_000_000   # Swarm navigation
-    stage5_end: int = 10_000_000  # Swarm + obstacles (final)
+    stage1_end: int = 1000#1_000_000   # Hovering
+    stage2_end: int = 2000#4_000_000   # Point-to-point
+    stage3_end: int = 4000#7_000_000   # Obstacle navigation
+    stage4_end: int = 8000#8_000_000   # Swarm navigation
+    stage5_end: int = 10000#10_000_000  # Swarm + obstacles (final)
     ##-- Separation spawan origins based on stages --
     # Stage-specific spatial offsets (where agents spawn)
     # Stages 1, 2, 4: origin at (0, 0)
@@ -78,8 +78,8 @@ class CurriculumCfg:
     swarm_translation_distance_max: float = 2.0  # Maximum formation translation (meters
 
     ##--- Stage 5 parameters ---##
-    stage5_offset_x: float = -10.0   # Keep X centered for stage 5
-    stage5_offset_y: float = 0.0  # Move agents 20m in Y for stage 5
+    stage5_offset_x: float = 0.0   # Keep X centered for stage 5
+    stage5_offset_y: float = 20.0  # Move agents 20m in Y for stage 5
     # Stage 5 obstacle distribution (stacked X pattern)
     stage5_obsx_offset: float = 2.0  # X spacing between wall segments in X pattern
     stage5_obsy_offset: float = 3.0  # Y spacing between wall segments in X pattern
@@ -98,7 +98,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     # ----- Episode / stepping -----
     episode_length_s = 30.0
     decimation = 2
-    num_agents: int = 3
+    num_agents: int = 5
     max_num_agents: int = 20
     curriculum:CurriculumCfg = CurriculumCfg()
     # MARL-specific: Define spaces for all agents
@@ -152,7 +152,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=2, env_spacing=50.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=5, env_spacing=50.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----

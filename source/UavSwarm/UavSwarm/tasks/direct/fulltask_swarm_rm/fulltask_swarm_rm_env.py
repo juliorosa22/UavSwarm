@@ -54,7 +54,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     def __init__(self, cfg: FullTaskUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
         
         self.num_drones = cfg.num_agents        
-        self.global_step=7_999_990
+        self.global_step=4500
         self.curriculum_stage=4
         self._obstacles_built=False
         # Initialize lists (before parent __init__)
@@ -597,6 +597,171 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                     self._current_swarm_waypoint_idx[env_idx] = self.num_swarm_waypoints
                     print(f"[Stage 5] Env {env_idx}: Swarm completed all waypoints!")
 
+    ##-- Build all the obstacle prims and its called in _setup_scene --##
+    def _build_all_obstacles(self):
+        """Build all obstacle prims at fixed locations for stages 3 and 5."""
+        self._build_stage3_obstacles()
+        self._build_stage5_obstacles()
+        self._obstacles_built = True
+        
+    def _build_stage3_obstacles(self):
+        """Build stage 3 obstacle course: 3 obstacles per agent in zig-zag pattern.
+        
+        Each agent gets 3 obstacles arranged in a zig-zag pattern:
+        - Obstacle 1: Centered in agent's lane
+        - Obstacle 2: Offset to left
+        - Obstacle 3: Offset to right
+        
+        This forces agents to learn lateral maneuvering (zig-zag movement).
+        """
+        from isaaclab.sim.spawners.shapes import CuboidCfg
+        from isaaclab.sim.schemas.schemas_cfg import (
+            RigidBodyPropertiesCfg,
+            CollisionPropertiesCfg,
+        )
+        from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
+        
+        stage3_offset = (self.cfg.curriculum.stage3_offset_x, self.cfg.curriculum.stage3_offset_y, 0.0)
+        source_env_idx = 0
+        
+        # Obstacle course parameters
+        obstacle_size = (0.2, 0.8, 2.5)  # (thickness, width, height)
+        base_height = 1.25  # Half of obstacle height
+        
+        # Lane configuration
+        lane_width = 1.5  # Width of each agent's lane
+        obstacle_spacing_x = 3.0  # Distance between obstacles along X-axis
+        lateral_offset = 0.4  # How far obstacles shift left/right
+        
+        # Starting X position for obstacle course
+        course_start_x = stage3_offset[0] + 3.0
+        
+        # Build obstacles for each agent
+        for agent_idx in range(self.num_drones):
+            # Calculate agent's lane center (Y coordinate)
+            lane_center_y = stage3_offset[1] + (agent_idx - (self.num_drones - 1) / 2.0) * lane_width
+            
+            # Create 3 obstacles in zig-zag pattern for this agent
+            for obs_idx in range(3):
+                # Calculate obstacle position
+                obs_x = course_start_x + obs_idx * obstacle_spacing_x
+                
+                # Zig-zag pattern: center, left, right
+                if obs_idx == 0:
+                    obs_y = lane_center_y  # Center
+                elif obs_idx == 1:
+                    obs_y = lane_center_y - lateral_offset  # Left
+                else:  # obs_idx == 2
+                    obs_y = lane_center_y + lateral_offset  # Right
+                
+                obs_z = base_height
+                
+                # Create obstacle prim
+                wall_path = f"/World/envs/env_{source_env_idx}/Stage3_Agent{agent_idx}_Obs{obs_idx}"
+                wall_cfg = CuboidCfg(
+                    size=obstacle_size,
+                    rigid_props=RigidBodyPropertiesCfg(
+                        rigid_body_enabled=True,
+                        kinematic_enabled=True,
+                        disable_gravity=True,
+                    ),
+                    collision_props=CollisionPropertiesCfg(collision_enabled=True),
+                    visual_material=PreviewSurfaceCfg(
+                        diffuse_color=(0.9, 0.1, 0.1),
+                        roughness=0.4,
+                        metallic=0.0,
+                    ),
+                )
+                wall_cfg.func(wall_path, wall_cfg, translation=(obs_x, obs_y, obs_z))
+        
+        print(f"[INFO] Built Stage 3 obstacle course:")
+        print(f"  - {self.num_drones} agents × 3 obstacles = {self.num_drones * 3} total obstacles")
+        print(f"  - Zig-zag pattern with {obstacle_spacing_x}m spacing")
+
+    def _build_stage5_obstacles(self):
+        """Build stage 5 obstacles in stacked X pattern.
+        
+        Creates 8 wall segments arranged in two X shapes stacked vertically:
+        - Bottom X: 3 walls (left, center, right)
+        - Top X: 5 walls (full X pattern)
+        
+        This forces swarm to navigate through strategic gaps while maintaining formation.
+        """
+        from isaaclab.sim.spawners.shapes import CuboidCfg
+        from isaaclab.sim.schemas.schemas_cfg import (
+            RigidBodyPropertiesCfg,
+            CollisionPropertiesCfg,
+        )
+        from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
+        
+        stage5_offset = (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y, 0.0)
+        source_env_idx = 0
+        
+        # Get offset configuration
+        x_offset = self.cfg.curriculum.stage5_obsx_offset  # 2.0m
+        y_offset = self.cfg.curriculum.stage5_obsy_offset  # 3.0m
+        
+        # Obstacle size: vertical walls blocking Y-axis travel
+        obstacle_size = (1.2, 0.2, 2.5)  # (length, thickness, height)
+        base_height = 1.25
+        dist_from_spawn_swarm = 3  # Distance from swarm spawn area to obstacle pattern
+        # Base Y position for the pattern
+        base_y = stage5_offset[1]+dist_from_spawn_swarm
+        base_x = stage5_offset[0]
+        
+        # Calculate wall positions based on stacked X pattern
+        # Pattern layout (Y increases upward):
+        #
+        #     wall7        wall8         (Y = base + 2*y_offset)
+        #           wall6               (Y = base + 1.5*y_offset) - center top X
+        #     wall4        wall5         (Y = base + y_offset)
+        #           wall3               (Y = base + 0.5*y_offset) - center bottom X
+        #     wall1  wall2               (Y = base)
+        
+        wall_positions = [
+            # Bottom X base (3 walls)
+            (base_x - x_offset, base_y, base_height),              # wall1 - left bottom
+            (base_x + x_offset, base_y, base_height),              # wall2 - right bottom
+            (base_x, base_y + 0.5 * y_offset, base_height),        # wall3 - center bottom
+            
+            # Middle layer (2 walls)
+            (base_x - x_offset, base_y + y_offset, base_height),   # wall4 - left middle
+            (base_x + x_offset, base_y + y_offset, base_height),   # wall5 - right middle
+            
+            # Top X (3 walls)
+            (base_x, base_y + 1.5 * y_offset, base_height),        # wall6 - center top
+            (base_x - x_offset, base_y + 2 * y_offset, base_height), # wall7 - left top
+            (base_x + x_offset, base_y + 2 * y_offset, base_height), # wall8 - right top
+        ]
+        
+        # Build all 8 wall segments
+        for wall_idx, (wall_x, wall_y, wall_z) in enumerate(wall_positions):
+            wall_path = f"/World/envs/env_{source_env_idx}/WallSegment_Stage5_{wall_idx}"
+            wall_cfg = CuboidCfg(
+                size=obstacle_size,
+                rigid_props=RigidBodyPropertiesCfg(
+                    rigid_body_enabled=True,
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                collision_props=CollisionPropertiesCfg(collision_enabled=True),
+                visual_material=PreviewSurfaceCfg(
+                    diffuse_color=(0.1, 0.1, 0.9),
+                    roughness=0.4,
+                    metallic=0.0,
+                ),
+            )
+            wall_cfg.func(wall_path, wall_cfg, translation=(wall_x, wall_y, wall_z))
+        
+        print(f"[INFO] Built Stage 5 stacked X obstacle pattern:")
+        print(f"  - 8 wall segments in X formation")
+        print(f"  - X offset: {x_offset}m, Y offset: {y_offset}m")
+        print(f"  - Base position: ({base_x}, {base_y})")
+    
+    
+
+
+
     ###---- Stage 1: Individual Hover ----###
     def _set_stage1_positions(self, env_ids, env_origins):
         """Set hover goals - simplified grid version."""
@@ -833,169 +998,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 # Set initial goal to first waypoint
                 self._desired_pos_w[env_id_single, j, :] = self._waypoint_paths[env_id_int, j, 0, :]
         
-        print(f"[Stage 3] Initialized obstacle course with {self.num_waypoints_per_agent} waypoints per agent")    
+        #print(f"[Stage 3] Initialized obstacle course with {self.num_waypoints_per_agent} waypoints per agent")    
    
-    ##-- Build all the obstacle prims and its called in _setup_scene --##
-    def _build_all_obstacles(self):
-        """Build all obstacle prims at fixed locations for stages 3 and 5."""
-        self._build_stage3_obstacles()
-        self._build_stage5_obstacles()
-        self._obstacles_built = True
-        
-    def _build_stage3_obstacles(self):
-        """Build stage 3 obstacle course: 3 obstacles per agent in zig-zag pattern.
-        
-        Each agent gets 3 obstacles arranged in a zig-zag pattern:
-        - Obstacle 1: Centered in agent's lane
-        - Obstacle 2: Offset to left
-        - Obstacle 3: Offset to right
-        
-        This forces agents to learn lateral maneuvering (zig-zag movement).
-        """
-        from isaaclab.sim.spawners.shapes import CuboidCfg
-        from isaaclab.sim.schemas.schemas_cfg import (
-            RigidBodyPropertiesCfg,
-            CollisionPropertiesCfg,
-        )
-        from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
-        
-        stage3_offset = (self.cfg.curriculum.stage3_offset_x, self.cfg.curriculum.stage3_offset_y, 0.0)
-        source_env_idx = 0
-        
-        # Obstacle course parameters
-        obstacle_size = (0.2, 0.8, 2.5)  # (thickness, width, height)
-        base_height = 1.25  # Half of obstacle height
-        
-        # Lane configuration
-        lane_width = 1.5  # Width of each agent's lane
-        obstacle_spacing_x = 3.0  # Distance between obstacles along X-axis
-        lateral_offset = 0.4  # How far obstacles shift left/right
-        
-        # Starting X position for obstacle course
-        course_start_x = stage3_offset[0] + 3.0
-        
-        # Build obstacles for each agent
-        for agent_idx in range(self.num_drones):
-            # Calculate agent's lane center (Y coordinate)
-            lane_center_y = stage3_offset[1] + (agent_idx - (self.num_drones - 1) / 2.0) * lane_width
-            
-            # Create 3 obstacles in zig-zag pattern for this agent
-            for obs_idx in range(3):
-                # Calculate obstacle position
-                obs_x = course_start_x + obs_idx * obstacle_spacing_x
-                
-                # Zig-zag pattern: center, left, right
-                if obs_idx == 0:
-                    obs_y = lane_center_y  # Center
-                elif obs_idx == 1:
-                    obs_y = lane_center_y - lateral_offset  # Left
-                else:  # obs_idx == 2
-                    obs_y = lane_center_y + lateral_offset  # Right
-                
-                obs_z = base_height
-                
-                # Create obstacle prim
-                wall_path = f"/World/envs/env_{source_env_idx}/Stage3_Agent{agent_idx}_Obs{obs_idx}"
-                wall_cfg = CuboidCfg(
-                    size=obstacle_size,
-                    rigid_props=RigidBodyPropertiesCfg(
-                        rigid_body_enabled=True,
-                        kinematic_enabled=True,
-                        disable_gravity=True,
-                    ),
-                    collision_props=CollisionPropertiesCfg(collision_enabled=True),
-                    visual_material=PreviewSurfaceCfg(
-                        diffuse_color=(0.9, 0.1, 0.1),
-                        roughness=0.4,
-                        metallic=0.0,
-                    ),
-                )
-                wall_cfg.func(wall_path, wall_cfg, translation=(obs_x, obs_y, obs_z))
-        
-        print(f"[INFO] Built Stage 3 obstacle course:")
-        print(f"  - {self.num_drones} agents × 3 obstacles = {self.num_drones * 3} total obstacles")
-        print(f"  - Zig-zag pattern with {obstacle_spacing_x}m spacing")
-
-    def _build_stage5_obstacles(self):
-        """Build stage 5 obstacles in stacked X pattern.
-        
-        Creates 8 wall segments arranged in two X shapes stacked vertically:
-        - Bottom X: 3 walls (left, center, right)
-        - Top X: 5 walls (full X pattern)
-        
-        This forces swarm to navigate through strategic gaps while maintaining formation.
-        """
-        from isaaclab.sim.spawners.shapes import CuboidCfg
-        from isaaclab.sim.schemas.schemas_cfg import (
-            RigidBodyPropertiesCfg,
-            CollisionPropertiesCfg,
-        )
-        from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
-        
-        stage5_offset = (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y, 0.0)
-        source_env_idx = 0
-        
-        # Get offset configuration
-        x_offset = self.cfg.curriculum.stage5_obsx_offset  # 2.0m
-        y_offset = self.cfg.curriculum.stage5_obsy_offset  # 3.0m
-        
-        # Obstacle size: vertical walls blocking Y-axis travel
-        obstacle_size = (1.2, 0.2, 2.5)  # (length, thickness, height)
-        base_height = 1.25
-        dist_from_spawn_swarm = 0  # Distance from swarm spawn area to obstacle pattern
-        # Base Y position for the pattern
-        base_y = stage5_offset[1]+dist_from_spawn_swarm
-        base_x = stage5_offset[0]
-        
-        # Calculate wall positions based on stacked X pattern
-        # Pattern layout (Y increases upward):
-        #
-        #     wall7        wall8         (Y = base + 2*y_offset)
-        #           wall6               (Y = base + 1.5*y_offset) - center top X
-        #     wall4        wall5         (Y = base + y_offset)
-        #           wall3               (Y = base + 0.5*y_offset) - center bottom X
-        #     wall1  wall2               (Y = base)
-        
-        wall_positions = [
-            # Bottom X base (3 walls)
-            (base_x - x_offset, base_y, base_height),              # wall1 - left bottom
-            (base_x + x_offset, base_y, base_height),              # wall2 - right bottom
-            (base_x, base_y + 0.5 * y_offset, base_height),        # wall3 - center bottom
-            
-            # Middle layer (2 walls)
-            (base_x - x_offset, base_y + y_offset, base_height),   # wall4 - left middle
-            (base_x + x_offset, base_y + y_offset, base_height),   # wall5 - right middle
-            
-            # Top X (3 walls)
-            (base_x, base_y + 1.5 * y_offset, base_height),        # wall6 - center top
-            (base_x - x_offset, base_y + 2 * y_offset, base_height), # wall7 - left top
-            (base_x + x_offset, base_y + 2 * y_offset, base_height), # wall8 - right top
-        ]
-        
-        # Build all 8 wall segments
-        for wall_idx, (wall_x, wall_y, wall_z) in enumerate(wall_positions):
-            wall_path = f"/World/envs/env_{source_env_idx}/WallSegment_Stage5_{wall_idx}"
-            wall_cfg = CuboidCfg(
-                size=obstacle_size,
-                rigid_props=RigidBodyPropertiesCfg(
-                    rigid_body_enabled=True,
-                    kinematic_enabled=True,
-                    disable_gravity=True,
-                ),
-                collision_props=CollisionPropertiesCfg(collision_enabled=True),
-                visual_material=PreviewSurfaceCfg(
-                    diffuse_color=(0.1, 0.1, 0.9),
-                    roughness=0.4,
-                    metallic=0.0,
-                ),
-            )
-            wall_cfg.func(wall_path, wall_cfg, translation=(wall_x, wall_y, wall_z))
-        
-        print(f"[INFO] Built Stage 5 stacked X obstacle pattern:")
-        print(f"  - 8 wall segments in X formation")
-        print(f"  - X offset: {x_offset}m, Y offset: {y_offset}m")
-        print(f"  - Base position: ({base_x}, {base_y})")
-    
     ###---- Stage 4: Swarm Navigation ----###
     #TODO adjust this stage to also use the swarm centroid waypoint logic
     def _set_stage4_positions(self, env_ids, env_origins):
@@ -1062,8 +1066,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 1] = goal_y
                 self._desired_pos_w[env_id_single, j, 2] = goal_z
 
-    ###---- Stage 5: Swarm Navigation with Obstacles ----###
-    
+    ###---- Stage 5: Swarm Navigation with Obstacles ----### 
     def _set_stage5_positions(self, env_ids, env_origins):
         """Set swarm waypoint navigation through stacked X obstacle pattern.
         
@@ -1071,6 +1074,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         - Waypoint 1: Center of bottom X (between wall1, wall2, wall3)
         - Waypoint 2: Center of middle gap (between wall4, wall5, wall6)
         - Waypoint 3: Center of top X (between wall6, wall7, wall8)
+        
+        The formation is rotated 90° to face the +Y direction (toward obstacles).
         
         Args:
             env_ids: Indices of environments to reset
@@ -1090,15 +1095,35 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         )
         
         # -----------------------------------------------------
-        # 1. START POSITIONS: Inverted V formation at stage offset
+        # 1. START POSITIONS: Inverted V formation ROTATED to face +Y
         # -----------------------------------------------------
         offset_origins = env_origins.clone()
         offset_origins[:, 0] += offset_x
         offset_origins[:, 1] += offset_y
         
+        # Get default formation (apex points in -X direction)
         formation_positions = self.get_inverted_v_formation(env_ids, offset_origins, spawn_heights)
         
-        # Reset robots with formation positions
+        # Rotate formation 90° counterclockwise to face +Y direction
+        # Rotation matrix for 90° CCW: [0, -1; 1, 0]
+        # New X = -Old Y
+        # New Y = Old X
+        for env_idx in range(num_reset_envs):
+            formation_center = formation_positions[env_idx].mean(dim=0)  # (3,)
+            
+            for j in range(self.num_drones):
+                # Get relative position from formation center
+                relative_pos = formation_positions[env_idx, j, :2] - formation_center[:2]  # (2,)
+                
+                # Apply 90° CCW rotation
+                rotated_x = -relative_pos[1]  # New X = -Old Y
+                rotated_y = -relative_pos[0]   # New Y = Old X
+                
+                # Update position
+                formation_positions[env_idx, j, 0] = formation_center[0] + rotated_x
+                formation_positions[env_idx, j, 1] = formation_center[1] + rotated_y
+        
+        # Reset robots with rotated formation positions
         for j, rob in enumerate(self._robots):
             joint_pos = rob.data.default_joint_pos[env_ids]
             joint_vel = rob.data.default_joint_vel[env_ids]
@@ -1157,7 +1182,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             # Get first waypoint (swarm centroid target)
             swarm_target = self._swarm_waypoint_paths[env_id_int, 0, :]  # (3,)
             
-            # Calculate formation center
+            # Calculate formation center (after rotation)
             formation_center = formation_positions[env_idx].mean(dim=0)  # (3,)
             
             # Set individual goals to maintain formation relative to swarm target
@@ -1172,8 +1197,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 1] = goal_pos[1]
                 self._desired_pos_w[env_id_single, j, 2] = goal_pos[2]
         
-        print(f"[Stage 5] Initialized swarm obstacle navigation with {self.num_swarm_waypoints} waypoints")
-
+        #print(f"[Stage 5] Initialized swarm obstacle navigation with {self.num_swarm_waypoints} waypoints")
+        #print(f"[Stage 5] Formation rotated 90° to face +Y direction (toward obstacles)")
 
 ###---- Formation Helper Method: Inverted V Formation ----###
 
