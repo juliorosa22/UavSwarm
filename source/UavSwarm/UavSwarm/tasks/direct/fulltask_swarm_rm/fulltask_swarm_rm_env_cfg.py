@@ -44,14 +44,14 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 @configclass
 class CurriculumCfg:
     # total training horizon (for reference)
-    total_steps: int = 10000
+    total_steps: int = 5000
 
     # boundaries between stages (in environment steps)
     stage1_end: int = 1000#1_000_000   # Hovering
     stage2_end: int = 2000#4_000_000   # Point-to-point
-    stage3_end: int = 4000#7_000_000   # Obstacle navigation
-    stage4_end: int = 8000#8_000_000   # Swarm navigation
-    stage5_end: int = 10000#10_000_000  # Swarm + obstacles (final)
+    stage3_end: int = 3000#7_000_000   # Obstacle navigation
+    stage4_end: int = 4000#8_000_000   # Swarm navigation
+    stage5_end: int = 5000#10_000_000  # Swarm + obstacles (final)
     ##-- Separation spawan origins based on stages --
     # Stage-specific spatial offsets (where agents spawn)
     # Stages 1, 2, 4: origin at (0, 0)
@@ -59,9 +59,6 @@ class CurriculumCfg:
     # Stage 5: origin at (stage5_offset_x, stage5_offset_y) where obstacles are
     
 
-
-    ##--- Stage 1 parameters ---##
-    stage1_goal_height_range: tuple = (1.0, 3.0)  # height range for all stages, should be below obstacle height
 
     ##--- Stage 2 parameters ---##
     stage2_goal_distance:float = 10.0  # xy-distance for point-to-point and obstacle navigation stages
@@ -83,10 +80,11 @@ class CurriculumCfg:
     # Stage 5 obstacle distribution (stacked X pattern)
     stage5_obsx_offset: float = 2.0  # X spacing between wall segments in X pattern
     stage5_obsy_offset: float = 3.0  # Y spacing between wall segments in X pattern
+    dist_from_spawn_swarm: float = 3.0  # Distance from spawn to first obstacle in swarm stage
     ##--- Common parameters ---##
     spawn_height_range: tuple = (0.5, 0.8)  # spawn height range for all stages
     spawn_grid_spacing_range: tuple = (0.5, 1.0)  # spacing range for grid spawn positions 
-
+    goal_height_range: tuple = (1.0, 4)  # goal height range for all stages
 
 
 @configclass

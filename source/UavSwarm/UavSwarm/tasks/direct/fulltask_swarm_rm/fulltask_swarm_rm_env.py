@@ -54,8 +54,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     def __init__(self, cfg: FullTaskUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
         
         self.num_drones = cfg.num_agents        
-        self.global_step=4500
-        self.curriculum_stage=4
+        self.global_step=0
+        self.curriculum_stage=1
         self._obstacles_built=False
         # Initialize lists (before parent __init__)
         self._robots = []
@@ -376,11 +376,10 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
 
     
     def _set_debug_vis_impl(self, debug_vis: bool):
-        """Enable/disable debug visualization (matching copy_quadenv.py)."""
         if debug_vis:
             # Import at the top of the debug_vis block so it's available everywhere
             from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-            from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG
+            from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, CUBOID_MARKER_CFG
             
             # ---------------------------------------------------------
             # Goal position markers (yellow spheres)
@@ -403,13 +402,40 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             if not hasattr(self, "centroid_visualizer"):
                 centroid_marker_cfg = BLUE_ARROW_X_MARKER_CFG.copy()
                 centroid_marker_cfg.prim_path = "/Visuals/Command/swarm_centroid"
-                
-                # Optional: adjust arrow size (uncomment if needed)
-                # centroid_marker_cfg.markers["arrow"].scale = (0.4, 0.4, 0.4)
-                
                 self.centroid_visualizer = VisualizationMarkers(centroid_marker_cfg)
 
-            self.centroid_visualizer.set_visibility(True)
+            # Always show centroid (will be hidden in callback if not stages 4/5)
+            if hasattr(self, "centroid_visualizer"):
+                self.centroid_visualizer.set_visibility(True)
+
+            # ---------------------------------------------------------
+            # Stage 3: Individual waypoint markers (green cuboids)
+            # ---------------------------------------------------------
+            if not hasattr(self, "stage3_waypoint_visualizers"):
+                self.stage3_waypoint_visualizers = []
+                for i in range(self.num_drones):
+                    for wp_idx in range(self.num_waypoints_per_agent):
+                        marker_cfg = CUBOID_MARKER_CFG.copy()
+                        marker_cfg.markers["cuboid"].size = (0.2, 0.2, 0.2)
+                        marker_cfg.markers["cuboid"].visual_material.diffuse_color = (0.0, 1.0, 0.0)  # green
+                        marker_cfg.prim_path = f"/Visuals/Command/stage3_waypoint_agent{i}_wp{wp_idx}"
+                        self.stage3_waypoint_visualizers.append(VisualizationMarkers(marker_cfg))
+            
+            # Don't set visibility here - let _debug_vis_callback handle it based on current stage
+
+            # ---------------------------------------------------------
+            # Stage 5: Swarm waypoint markers (green cuboids)
+            # ---------------------------------------------------------
+            if not hasattr(self, "stage5_waypoint_visualizers"):
+                self.stage5_waypoint_visualizers = []
+                for wp_idx in range(self.num_swarm_waypoints):
+                    marker_cfg = CUBOID_MARKER_CFG.copy()
+                    marker_cfg.markers["cuboid"].size = (0.3, 0.3, 0.3)  # Larger for swarm waypoints
+                    marker_cfg.markers["cuboid"].visual_material.diffuse_color = (0.0, 1.0, 0.0)  # green
+                    marker_cfg.prim_path = f"/Visuals/Command/stage5_swarm_waypoint_{wp_idx}"
+                    self.stage5_waypoint_visualizers.append(VisualizationMarkers(marker_cfg))
+            
+            # Don't set visibility here - let _debug_vis_callback handle it based on current stage
 
         # ------------------------------------------------------------------
         # Disable all visualizations
@@ -421,17 +447,60 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
 
             if hasattr(self, "centroid_visualizer"):
                 self.centroid_visualizer.set_visibility(False)
+
+            if hasattr(self, "stage3_waypoint_visualizers"):
+                for viz in self.stage3_waypoint_visualizers:
+                    viz.set_visibility(False)
+
+            if hasattr(self, "stage5_waypoint_visualizers"):
+                for viz in self.stage5_waypoint_visualizers:
+                    viz.set_visibility(False)
                 
     def _debug_vis_callback(self, event):
         """Update debug visualization markers (matching copy_quadenv.py)."""
-        # Update goal position markers
+        # Update goal position markers (always visible)
         if hasattr(self, "goal_pos_visualizers"):
             for i, viz in enumerate(self.goal_pos_visualizers):
                 viz.visualize(self._desired_pos_w[:, i, :])
         
         # Update swarm centroid marker (only for stages 4 and 5)
-        if hasattr(self, "centroid_visualizer") and self.curriculum_stage in [4, 5]:
-            self.centroid_visualizer.visualize(self._swarm_centroid)
+        if hasattr(self, "centroid_visualizer"):
+            if self.curriculum_stage in [4, 5]:
+                self.centroid_visualizer.set_visibility(True)
+                self.centroid_visualizer.visualize(self._swarm_centroid)
+            else:
+                self.centroid_visualizer.set_visibility(False)
+        
+        # Update stage 3 waypoint markers (green cuboids)
+        if hasattr(self, "stage3_waypoint_visualizers"):
+            if self.curriculum_stage == 3:
+                # Show and update waypoints
+                viz_idx = 0
+                for agent_idx in range(self.num_drones):
+                    for wp_idx in range(self.num_waypoints_per_agent):
+                        # Get waypoint positions for all environments: (num_envs, 3)
+                        waypoint_positions = self._waypoint_paths[:, agent_idx, wp_idx, :]
+                        self.stage3_waypoint_visualizers[viz_idx].set_visibility(True)
+                        self.stage3_waypoint_visualizers[viz_idx].visualize(waypoint_positions)
+                        viz_idx += 1
+            else:
+                # Hide all stage 3 waypoints
+                for viz in self.stage3_waypoint_visualizers:
+                    viz.set_visibility(False)
+        
+        # Update stage 5 swarm waypoint markers (green cuboids)
+        if hasattr(self, "stage5_waypoint_visualizers"):
+            if self.curriculum_stage == 5:
+                # Show and update waypoints
+                for wp_idx in range(self.num_swarm_waypoints):
+                    # Get swarm waypoint positions for all environments: (num_envs, 3)
+                    waypoint_positions = self._swarm_waypoint_paths[:, wp_idx, :]
+                    self.stage5_waypoint_visualizers[wp_idx].set_visibility(True)
+                    self.stage5_waypoint_visualizers[wp_idx].visualize(waypoint_positions)
+            else:
+                # Hide all stage 5 waypoints
+                for viz in self.stage5_waypoint_visualizers:
+                    viz.set_visibility(False)
     
     def _reset_idx(self, env_ids: torch.Tensor | None):
         """Reset environments with curriculum-dependent goals & scene adjustments."""
@@ -662,8 +731,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         source_env_idx = 0
         
         # Obstacle course parameters
-        obstacle_size = (0.2, 0.8, 2.5)  # (thickness, width, height)
-        base_height = 1.25  # Half of obstacle height
+        obstacle_size = (0.2, 0.8, 5.0)  # (thickness, width, height)
+        base_height = 2.5  # Half of obstacle height
         
         # Lane configuration
         lane_width = 1.5  # Width of each agent's lane
@@ -739,9 +808,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         y_offset = self.cfg.curriculum.stage5_obsy_offset  # 3.0m
         
         # Obstacle size: vertical walls blocking Y-axis travel
-        obstacle_size = (1.2, 0.2, 2.5)  # (length, thickness, height)
-        base_height = 1.25
-        dist_from_spawn_swarm = 3  # Distance from swarm spawn area to obstacle pattern
+        obstacle_size = (1.2, 0.2, 5)  # (length, thickness, height)
+        base_height = 2.5
+        dist_from_spawn_swarm = self.cfg.curriculum.dist_from_spawn_swarm  # Distance from swarm spawn area to obstacle pattern
         # Base Y position for the pattern
         base_y = stage5_offset[1]+dist_from_spawn_swarm
         base_x = stage5_offset[0]
@@ -825,8 +894,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             
             # Sample heights
             start_heights = torch.zeros(self.num_drones, device=self.device).uniform_(0.3, 0.6)
-            min_height = self.cfg.curriculum.stage1_goal_height_range[0]
-            max_height = self.cfg.curriculum.stage1_goal_height_range[1]
+            min_height = self.cfg.curriculum.goal_height_range[0]
+            max_height = self.cfg.curriculum.goal_height_range[1]
             goal_heights = torch.zeros(self.num_drones, device=self.device).uniform_(min_height, max_height) 
             
             for j, rob in enumerate(self._robots):
@@ -1054,10 +1123,11 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         num_reset_envs = len(env_ids)
         
         spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
-            self.cfg.curriculum.spawn_height_range[0], 
-            self.cfg.curriculum.spawn_height_range[1]
+            self.cfg.curriculum.goal_height_range[0], 
+            self.cfg.curriculum.goal_height_range[1]
         )
-        
+        #min_goal_height = self.cfg.curriculum.goal_height_range[0]
+        #max_goal_height = self.cfg.curriculum.goal_height_range[1]
         # Start positions: Inverted V formation
         formation_positions = self.get_inverted_v_formation(env_ids, env_origins, spawn_heights)
         
@@ -1095,7 +1165,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             sin_theta = torch.sin(torch.tensor(rotation_angle, device=self.device))
             
             formation_center = formation_positions[env_idx].mean(dim=0)
-            
+            swarm_goal_height = spawn_heights[env_idx] + torch.zeros(1, device=self.device).uniform_(-0.5, 0.5).item()
             for j in range(self.num_drones):
                 start_pos = formation_positions[env_idx, j]
                 relative_pos = start_pos[:2] - formation_center[:2]
@@ -1107,7 +1177,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 # Translate to goal
                 goal_x = formation_center[0] + translation_x + rotated_x
                 goal_y = formation_center[1] + translation_y + rotated_y
-                goal_z = start_pos[2] + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+                goal_z = start_pos[2] + swarm_goal_height
                 
                 self._desired_pos_w[env_id_single, j, 0] = goal_x
                 self._desired_pos_w[env_id_single, j, 1] = goal_y
@@ -1137,8 +1207,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         # Sample spawn heights
         spawn_heights = torch.zeros(num_reset_envs, device=self.device).uniform_(
-            self.cfg.curriculum.spawn_height_range[0], 
-            self.cfg.curriculum.spawn_height_range[1]
+            self.cfg.curriculum.goal_height_range[0], 
+            self.cfg.curriculum.goal_height_range[1]
         )
         
         # -----------------------------------------------------
@@ -1153,8 +1223,6 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         # Rotate formation 90° counterclockwise to face +Y direction
         # Rotation matrix for 90° CCW: [0, -1; 1, 0]
-        # New X = -Old Y
-        # New Y = Old X
         for env_idx in range(num_reset_envs):
             formation_center = formation_positions[env_idx].mean(dim=0)  # (3,)
             
@@ -1184,15 +1252,21 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # -----------------------------------------------------
         # 2. SWARM WAYPOINT PATHS (3 waypoints through X pattern)
         # -----------------------------------------------------
+        min_goal_height = self.cfg.curriculum.goal_height_range[0]
+        max_goal_height = self.cfg.curriculum.goal_height_range[1]
+        # Obstacle base Y position (where obstacles actually start)
+        dist_y_from_spawn_swarm =  self.cfg.curriculum.dist_from_spawn_swarm
+    
         for env_idx in range(num_reset_envs):
             env_id_int = env_ids[env_idx].item()
             
             base_height = spawn_heights[env_idx].item()
+            swarm_goal_height= torch.zeros(1, device=self.device).uniform_(-0.5, 0.5).item()
             
             # Waypoint 1: Gap in bottom X (between wall3 and wall4/5)
             wp1_x = env_origins[env_idx, 0] + offset_x
-            wp1_y = env_origins[env_idx, 1] + offset_y + 0.75 * y_offset  # Between center and middle
-            wp1_z = base_height + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+            wp1_y = env_origins[env_idx, 1] + offset_y +dist_y_from_spawn_swarm +0.75 * y_offset  # Between center and middle
+            wp1_z = base_height + swarm_goal_height
             
             self._swarm_waypoint_paths[env_id_int, 0, 0] = wp1_x
             self._swarm_waypoint_paths[env_id_int, 0, 1] = wp1_y
@@ -1200,8 +1274,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             
             # Waypoint 2: Gap in middle (between wall4/5 and wall6)
             wp2_x = env_origins[env_idx, 0] + offset_x
-            wp2_y = env_origins[env_idx, 1] + offset_y + 1.25 * y_offset  # Between middle and center top
-            wp2_z = base_height + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+            wp2_y = env_origins[env_idx, 1] + offset_y +dist_y_from_spawn_swarm +1.25 * y_offset  # Between middle and center top
+            wp2_z = base_height + swarm_goal_height
             
             self._swarm_waypoint_paths[env_id_int, 1, 0] = wp2_x
             self._swarm_waypoint_paths[env_id_int, 1, 1] = wp2_y
@@ -1209,8 +1283,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             
             # Waypoint 3: Final position beyond top X
             wp3_x = env_origins[env_idx, 0] + offset_x
-            wp3_y = env_origins[env_idx, 1] + offset_y + 2.5 * y_offset  # Beyond wall7/8
-            wp3_z = base_height + torch.zeros(1, device=self.device).uniform_(-0.1, 0.1).item()
+            wp3_y = env_origins[env_idx, 1] + offset_y +dist_y_from_spawn_swarm +2.5 * y_offset  # Beyond wall7/8
+            wp3_z = base_height + swarm_goal_height
             
             self._swarm_waypoint_paths[env_id_int, 2, 0] = wp3_x
             self._swarm_waypoint_paths[env_id_int, 2, 1] = wp3_y
