@@ -21,6 +21,10 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
 
+from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.utils import configclass as omniclass
+
+
 class UavSwarmEnvWindow(BaseEnvWindow):
     """Window manager for the UAV Swarm environment."""
 
@@ -99,10 +103,16 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     num_agents: int = 5
     max_num_agents: int = 20
     curriculum:CurriculumCfg = CurriculumCfg()
+
+     # ----- RayCaster Sensor Configuration -----
+    num_rays: int = 16  # Number of rays for lidar-like sensor
+    ray_max_distance: float = 5.0  # Maximum detection distance (meters)
+    
+    single_observation_space = 12 + num_rays
     # MARL-specific: Define spaces for all agents
     # Per-agent action/observation dimensions
     single_action_space = 4  # thrust + 3 moments per drone
-    single_observation_space = 12  # lin_vel[3] + ang_vel[3] + gravity[3] + desired_pos[3]
+    single_observation_space = 21  # lin_vel[3] + ang_vel[3] + gravity[3] + desired_pos[3] + raysensor[9]
     
     # Required for DirectMARLEnvCfg - using robot names as keys
     possible_agents = [f"robot_{i}" for i in range(num_agents)]
@@ -165,6 +175,29 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
             ),
             visual_material_path="/World/Looks/CrazyflieBlack",  # Unique path for material
         )
+    )
+
+    # ----- RayCaster Sensor (Lidar-like) -----
+    # This will be added to each robot instance in the environment
+    ray_caster_cfg: RayCasterCfg = RayCasterCfg(
+        prim_path="/World/envs/env_.*/Robot/body",
+        offset=RayCasterCfg.OffsetCfg(
+            pos=(0.03, 0.0, 0.0),  # 3cm forward
+            rot=(0.7071, 0.0, 0.0, 0.7071),  # Face forward (90° pitch)
+        ),
+        attach_yaw_only=False,
+        pattern_cfg=patterns.GridPatternCfg(
+            resolution=7.5,  # Angular resolution in degrees
+            size=(16, 1),  # 16 rays in horizontal plane, 1 layer
+        ),
+        max_distance=ray_max_distance,
+        drift_range=(0.0, 0.0),
+        debug_vis=True,
+        mesh_prim_paths=[
+            "/World/ground",
+            "/World/envs/env_.*/Stage3_Agent.*",
+            "/World/envs/env_.*/WallSegment_Stage5_.*",
+        ],
     )
 
     # Action -> force/torque conversion

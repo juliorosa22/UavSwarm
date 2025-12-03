@@ -17,7 +17,7 @@ from isaaclab.utils.math import subtract_frame_transforms
 
 from .fulltask_swarm_rm_env_cfg import FullTaskUAVSwarmEnvCfg
 from isaaclab.markers import SPHERE_MARKER_CFG  # isort: skip
-
+from isaaclab.sensors import RayCaster
 #check out https://isaac-sim.github.io/IsaacLab/main/source/tutorials/03_envs/create_direct_rl_env.html for more details on the functions implemented in DirectMARLEnv workflow
 """
 Main idea of how use the Direct workflow when designing a task
@@ -60,10 +60,10 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Initialize lists (before parent __init__)
         self._robots = []
         self._body_ids = []
-        
+        self._ray_casters = [] 
         # Call parent constructor (triggers _setup_scene)
         super().__init__(cfg, render_mode, **kwargs)
-
+        
         # Now device is available, initialize tensors
         self._actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         self._thrust = torch.zeros(self.num_envs, self.num_drones, 1, 3, device=self.device)
@@ -147,6 +147,14 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self.scene.articulations[f"robot_{i}"] = robot
             self._robots.append(robot)
 
+            # RayCaster sensor configuration (attach to each robot)
+            ray_caster_cfg = self.cfg.ray_caster_cfg.replace(
+                prim_path=f"/World/envs/env_.*/Robot_{i}/body"
+            )
+            ray_caster = RayCaster(ray_caster_cfg)
+            self.scene.sensors[f"ray_caster_{i}"] = ray_caster
+            self._ray_casters.append(ray_caster)
+        
         # Build all obstacles before simulation
         self._build_all_obstacles()
 
@@ -205,18 +213,15 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 body_ids=self._body_ids[j]
             )
     # as in the link tutorial: For asymmetric policies, the dictionary should also include the key critic and the states buffer as the value.
-
-
-    
+  
     def _get_observations(self) -> dict:
-        """Get observations for each drone (12 dims per drone).
+        """Get observations for each drone including RayCaster distances.
         
         Returns:
             Dictionary mapping agent names directly to observations.
-            Format: {"robot_0": obs0, "robot_1": obs1, "robot_2": obs2}
+            Format: {"robot_0": obs0, "robot_1": obs1, ...}
         """
         obs_dict = {}
-        #obs_list = []
         
         for j, rob in enumerate(self._robots):
             agent_name = f"robot_{j}"
@@ -228,6 +233,22 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[:, j, :]
             )
             
+            # Get RayCaster distances (CORRECTED)
+            ray_caster = self._ray_casters[j]
+            ray_distances = ray_caster.data.ray_distances  # ✅ Use ray_distances, not ray_hits_w
+            # Shape: (num_envs, num_rays)
+            
+            # Handle invalid rays (rays that didn't hit anything)
+            # Invalid rays return -1.0, clamp them to max_distance
+            ray_distances = torch.where(
+                ray_distances < 0.0,
+                torch.full_like(ray_distances, self.cfg.ray_max_distance),
+                ray_distances
+            )
+            
+            # Clamp to valid range [0, max_distance]
+            ray_distances = torch.clamp(ray_distances, 0.0, self.cfg.ray_max_distance)
+            
             # Concatenate observation components
             obs_j = torch.cat(
                 [
@@ -235,24 +256,21 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                     rob.data.root_ang_vel_b,       # (num_envs, 3)
                     rob.data.projected_gravity_b,  # (num_envs, 3)
                     desired_pos_b,                 # (num_envs, 3)
+                    ray_distances,                 # (num_envs, num_rays)
                 ],
                 dim=-1,
-            )  # -> (num_envs, 12)
+            )  # -> (num_envs, 12 + num_rays)
             
             obs_dict[agent_name] = obs_j
-            #obs_list.append(obs_j)
         
-        # Concatenate all observations for centralized critic (state)
-        #state = torch.cat(obs_list, dim=-1)  # (num_envs, num_agents * 12)
         return obs_dict
-        #return {"policy": obs_dict, "critic": state}
-        
+
     def _get_states(self) -> torch.Tensor:
         """Get centralized state for MAPPO critic.
         
         Returns:
             Concatenated observations from all agents for centralized critic.
-            Shape: (num_envs, num_agents * obs_dim) = (num_envs, 3 * 12) = (num_envs, 36)
+            Shape: (num_envs, num_agents * obs_dim)
         """
         state_list = []
         
@@ -264,6 +282,21 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[:, j, :]
             )
             
+            # Get RayCaster distances (CORRECTED)
+            ray_caster = self._ray_casters[j]
+            ray_distances = ray_caster.data.ray_distances  # ✅ Use ray_distances
+            # Shape: (num_envs, num_rays)
+            
+            # Handle invalid rays
+            ray_distances = torch.where(
+                ray_distances < 0.0,
+                torch.full_like(ray_distances, self.cfg.ray_max_distance),
+                ray_distances
+            )
+            
+            # Clamp to valid range
+            ray_distances = torch.clamp(ray_distances, 0.0, self.cfg.ray_max_distance)
+            
             # Same observation components as individual observations
             obs_j = torch.cat(
                 [
@@ -271,17 +304,17 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                     rob.data.root_ang_vel_b,       # (num_envs, 3)
                     rob.data.projected_gravity_b,  # (num_envs, 3)
                     desired_pos_b,                 # (num_envs, 3)
+                    ray_distances,                 # (num_envs, num_rays)
                 ],
                 dim=-1,
-            )  # -> (num_envs, 12)
+            )  # -> (num_envs, 12 + num_rays)
             
             state_list.append(obs_j)
         
         # Concatenate all agent observations into global state
-        state = torch.cat(state_list, dim=-1)  # (num_envs, num_agents * 12)
+        state = torch.cat(state_list, dim=-1)  # (num_envs, num_agents * (12 + num_rays))
         
         return state
-
 
     ##TODO : adjust rewards weights and terms based on current stage in the curriculum
     def _get_rewards(self) -> dict[str, torch.Tensor]:
