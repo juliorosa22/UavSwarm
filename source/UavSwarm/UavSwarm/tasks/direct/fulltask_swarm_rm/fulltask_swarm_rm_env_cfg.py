@@ -88,7 +88,7 @@ class CurriculumCfg:
     ##--- Common parameters ---##
     spawn_height_range: tuple = (0.5, 0.8)  # spawn height range for all stages
     spawn_grid_spacing_range: tuple = (0.5, 1.0)  # spacing range for grid spawn positions 
-    goal_height_range: tuple = (1.0, 4)  # goal height range for all stages
+    goal_height_range: tuple = (3.0, 20.0)  # goal height range for all stages
 
 
 @configclass
@@ -104,28 +104,54 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     max_num_agents: int = 20
     curriculum:CurriculumCfg = CurriculumCfg()
 
-     # ----- RayCaster Sensor Configuration -----
-    num_rays: int = 16  # Number of rays for lidar-like sensor
-    ray_max_distance: float = 5.0  # Maximum detection distance (meters)
+    # ----- Obstacle Distance Observation -----
+    max_obstacle_distance: float = 10.0  # Maximum distance to clamp obstacle measurements (meters)
+
     
-    single_observation_space = 12 + num_rays # lin_vel[3] + ang_vel[3] + gravity[3] + desired_pos[3] + raysensor[num_rays]
-    # MARL-specific: Define spaces for all agents
-    # Per-agent action/observation dimensions
+    # ----- Neighbor Sensing -----
+    max_neighbor_distance: float = 15.0  # Maximum distance for neighbor sensing (used as default in stages 1-3)
+    
+    # ----- Reward Machine States Parameters -----
+    hover_min_altitude: float = 1  # Minimum altitude to exit hovering state
+    close_obs_dist_thresh: float = 2.0  # Distance threshold to enter obstacle-avoiding state
+    num_rm_states: int = 4  # Number of RM states
+
+
+    # ✅ REBALANCED BASE REWARD SCALES
+    lin_vel_reward_scale: float = -0.01  # Reduced from -0.05
+    ang_vel_reward_scale: float = -0.01  # Reduced from -0.05
+    distance_to_goal_reward_scale: float = 1.0  # Reduced from 1.5
+    
+    formation_penalty_scale: float = -0.3  # Reduced from -0.5
+    collision_penalty_scale: float = -5.0  # Reduced from -10.0
+    
+    # ✅ NEW: RM STATE-AWARE BONUS SCALES
+    altitude_bonus_scale: float = 0.5  # Bonus for maintaining target altitude (Hovering state)
+    obstacle_bonus_scale: float = 0.8  # Bonus for safe obstacle clearance (Obstacle-avoiding state)
+    neighbor_bonus_scale: float = 0.5  # Bonus for optimal neighbor distance (Coop-moving state)
+    state_progress_scale: float = 0.3  # Bonus for state progression (all states)
+    
+    # ✅ NEW: Safe distance thresholds
+    safe_obstacle_distance: float = 2.0  # Meters - distance considered "safe" from obstacles
+    optimal_neighbor_distance: float = 3.0  # Meters - target distance between cooperating neighbors
+
+    #------ENV Spaces dimensions
+    # 12 base + 1 obstacle distance + 3 neighbor relative velocity + 3 neighbor relative position + 4 RM state (one-hot) = 23
+    single_observation_space = 23  # lin_vel[3] + ang_vel[3] + gravity[3] + desired_pos[3] + nearest_obstacle_dist[1] + neighbor_rel_vel[3] + neighbor_rel_pos[3] + rm_state_onehot[4]
+    # Policy- Action dimensions
     single_action_space = 4  # thrust + 3 moments per drone
     
+    #Critic- Observation dimensions
+    state_space = num_agents * single_observation_space  
     
     # Required for DirectMARLEnvCfg - using robot names as keys
     possible_agents = [f"robot_{i}" for i in range(num_agents)]
     action_spaces = {f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)}
     observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(num_agents)}
     
-    # MAPPO requires state space for centralized critic
-    # State = concatenation of all agents' observations
-    state_space = num_agents * single_observation_space  # 5 * 28 = 140
+    
     debug_vis = True
-
     ui_window_class_type = UavSwarmEnvWindow
-
     # ----- Simulation -----
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 100, #each step is 10ms
@@ -177,26 +203,26 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
         )
     )
 
-    # ----- RayCaster Sensor (Lidar-like) -----
+    # ----- RayCaster Sensor (Lidar-like) No more until its stable by NVIDIA TEAM -----
     # This will be added to each robot instance in the environment
-    ray_caster_cfg: RayCasterCfg = RayCasterCfg(
-        prim_path="/World/envs/env_.*/Robot/body",
-        update_period=0.0,  # Update every sim step
-        ##history_len=0,
-        offset=RayCasterCfg.OffsetCfg(
-            pos=(0.03, 0.0, 0.0),  # 3cm forward
-            rot=(0.7071, 0.0, 0.0, 0.7071),  # Face forward (90° pitch)
-        ),
-        attach_yaw_only=False,
-        pattern_cfg=patterns.GridPatternCfg(
-            resolution=7.5,  # Angular resolution in degrees
-            size=(16, 1),  # 16 rays in horizontal plane, 1 layer
-        ),
-        max_distance=ray_max_distance,
-        drift_range=(0.0, 0.0),
-        debug_vis=True,
-        mesh_prim_paths=["/World/ground"],  # Detect the obstacle by physics terrain only
-    )
+    # ray_caster_cfg: RayCasterCfg = RayCasterCfg(
+    #     prim_path="/World/envs/env_.*/Robot/body",
+    #     update_period=0.0,  # Update every sim step
+    #     ##history_len=0,
+    #     offset=RayCasterCfg.OffsetCfg(
+    #         pos=(0.03, 0.0, 0.0),  # 3cm forward
+    #         rot=(0.7071, 0.0, 0.0, 0.7071),  # Face forward (90° pitch)
+    #     ),
+    #     attach_yaw_only=False,
+    #     pattern_cfg=patterns.GridPatternCfg(
+    #         resolution=7.5,  # Angular resolution in degrees
+    #         size=(16, 1),  # 16 rays in horizontal plane, 1 layer
+    #     ),
+    #     max_distance=ray_max_distance,
+    #     drift_range=(0.0, 0.0),
+    #     debug_vis=True,
+    #     mesh_prim_paths=["/World/ground"],  # Detect the obstacle by physics terrain only
+    # )
 
     # Action -> force/torque conversion
     thrust_to_weight = 1.9
@@ -214,7 +240,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     # ----- Inverted V Formation parameters -----
     # Inverted V: apex at front (negative X), wings spread back (positive X) and outward (±Y)
     formation_base_separation = 0.8      # Base separation between adjacent drones
-    formation_v_angle_deg = 45.0         # Angle of the V arms (degrees from vertical)
+    formation_v_angle_deg = 60.0         # Angle of the V arms (degrees from vertical)
     formation_apex_offset = 0.0          # Forward offset for apex drone
     
     # Spawn and hover heights

@@ -14,3 +14,14 @@
   'cfg', 'data', 'device', 'has_debug_vis_implementation', 'is_initialized', 
   'meshes', 'num_instances', 'ray_visualizer', 'reset', 'set_debug_vis', 
   'stage', 'update']
+
+
+  switch(agent_state)
+    case 'H':
+        if agent_z > hover_min_z: agent_state='SM'
+    case 'SM':
+        if agent_obstacle_distance < close_obs_dist: agent_state = 'OM'    
+        if agent_neighbor_dist < max_neighbor_distance: agent_state='CM'
+    case 'CM':
+    case 'OM':
+        if agent_obstacle_distance > close_obs_dist: agent_state = 'SM'    
