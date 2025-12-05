@@ -108,20 +108,20 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     num_rays: int = 16  # Number of rays for lidar-like sensor
     ray_max_distance: float = 5.0  # Maximum detection distance (meters)
     
-    single_observation_space = 12 + num_rays
+    single_observation_space = 12 + num_rays # lin_vel[3] + ang_vel[3] + gravity[3] + desired_pos[3] + raysensor[num_rays]
     # MARL-specific: Define spaces for all agents
     # Per-agent action/observation dimensions
     single_action_space = 4  # thrust + 3 moments per drone
-    single_observation_space = 21  # lin_vel[3] + ang_vel[3] + gravity[3] + desired_pos[3] + raysensor[9]
+    
     
     # Required for DirectMARLEnvCfg - using robot names as keys
     possible_agents = [f"robot_{i}" for i in range(num_agents)]
     action_spaces = {f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)}
-    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(12,)) for i in range(num_agents)}
+    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(num_agents)}
     
     # MAPPO requires state space for centralized critic
     # State = concatenation of all agents' observations
-    state_space = num_agents * single_observation_space  # 3 * 12 = 36
+    state_space = num_agents * single_observation_space  # 5 * 28 = 140
     debug_vis = True
 
     ui_window_class_type = UavSwarmEnvWindow
@@ -181,6 +181,8 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     # This will be added to each robot instance in the environment
     ray_caster_cfg: RayCasterCfg = RayCasterCfg(
         prim_path="/World/envs/env_.*/Robot/body",
+        update_period=0.0,  # Update every sim step
+        ##history_len=0,
         offset=RayCasterCfg.OffsetCfg(
             pos=(0.03, 0.0, 0.0),  # 3cm forward
             rot=(0.7071, 0.0, 0.0, 0.7071),  # Face forward (90° pitch)
@@ -193,11 +195,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
         max_distance=ray_max_distance,
         drift_range=(0.0, 0.0),
         debug_vis=True,
-        mesh_prim_paths=[
-            "/World/ground",
-            "/World/envs/env_.*/Stage3_Agent.*",
-            "/World/envs/env_.*/WallSegment_Stage5_.*",
-        ],
+        mesh_prim_paths=["/World/ground"],  # Detect the obstacle by physics terrain only
     )
 
     # Action -> force/torque conversion

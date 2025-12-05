@@ -33,14 +33,17 @@ Main idea of how use the Direct workflow when designing a task
 ###-----Domain Randomization:
     Its also possible to implement domain randomization using the EventTerm and EventTermCfg
     Once the configclass for the randomization terms have been set up, the class must be added to the base config class for the task and be assigned to the variable events.
-
+    # add articulation to scene - we must register to scene to randomize with EventManager
+        self.scene.articulations["robot"] = self.hand
+        self.scene.rigid_objects["object"] = self.object
+        self.scene.sensors["tiled_camera"] = self._tiled_camera
     @configclass
     class MyTaskConfig:
     events: EventCfg = EventCfg()
 
 """
 
-
+#TODO Remove all the usage of ray_caster. after some on NVIDIA Isaac Sim team confirmed that the ray caster sensor is not working properly with multiple obstacles yet and MARL envs.
 class FullTaskUAVSwarmEnv(DirectMARLEnv):
     """
     Direct-style MARL environment with N Crazyflies per env.
@@ -55,7 +58,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         self.num_drones = cfg.num_agents        
         self.global_step=0
-        self.curriculum_stage=1
+        self.curriculum_stage=1990
         self._obstacles_built=False
         # Initialize lists (before parent __init__)
         self._robots = []
@@ -134,38 +137,58 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
-        # Create N Crazyflies per environment with distinct prim paths and materials
+        # Create N Crazyflies per environment AND their sensors
         for i in range(self.num_drones):
+            # Robot configuration
             robot_cfg: ArticulationCfg = self.cfg.robot_template.replace(
                 prim_path=f"/World/envs/env_.*/Robot_{i}"
             ).replace(
                 spawn=self.cfg.robot_template.spawn.replace(
-                    visual_material_path=f"/World/Looks/Crazyflie_{i}"  # Unique path per drone
+                    visual_material_path=f"/World/Looks/Crazyflie_{i}"
                 )
             )
             robot = Articulation(robot_cfg)
             self.scene.articulations[f"robot_{i}"] = robot
             self._robots.append(robot)
-
-            # RayCaster sensor configuration (attach to each robot)
+            
+            # ✅ Create RayCaster BEFORE cloning
             ray_caster_cfg = self.cfg.ray_caster_cfg.replace(
-                prim_path=f"/World/envs/env_.*/Robot_{i}/body"
+                prim_path=f"/World/envs/env_.*/Robot_{i}/body"  # ✅ Source env only
             )
             ray_caster = RayCaster(ray_caster_cfg)
+            #print(dir(ray_caster))
             self.scene.sensors[f"ray_caster_{i}"] = ray_caster
             self._ray_casters.append(ray_caster)
         
-        # Build all obstacles before simulation
+        # Build obstacles (in source environment only)
         self._build_all_obstacles()
 
-        # Clone environments
+        # ✅ Clone environments (will replicate sensors automatically)
         self.scene.clone_environments(copy_from_source=False)
         
-        # Filter collisions for CPU simulation
+
+        for i, ray_caster in enumerate(self._ray_casters):
+            # Update prim path to wildcard pattern
+            #ray_caster.cfg.prim_path = f"/World/envs/env_.*/Robot_{i}/body"
+            
+            # Manually resize internal buffers to match num_envs
+            # This fixes the buffer size mismatch
+            ray_caster._num_envs = self.num_envs
+            ray_caster._timestamp_last_update = torch.zeros(self.num_envs, device=self.device)
+            
+            # Re-scan for all cloned instances
+            #ray_caster._initialize_impl()
+            #ray_caster._update_buffers_impl()
+            
+            
+            print(f"[INFO] RayCaster {i}: Reinitialized with buffer shape {ray_caster._timestamp_last_update.shape}")
+    
+    
+        # Filter collisions
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
         
-        # Add lighting
+        # Lighting
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
@@ -213,7 +236,43 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 body_ids=self._body_ids[j]
             )
     # as in the link tutorial: For asymmetric policies, the dictionary should also include the key critic and the states buffer as the value.
-  
+    
+    def _get_raycaster_data(self, robot_index: int) -> torch.Tensor:
+        """Get RayCaster distance measurements for a specific robot.
+        
+        Args:
+            robot_index: Index of the robot (0 to num_drones-1)
+        
+        Returns:
+            Tensor of ray distances, shape (num_envs, num_rays)
+            Invalid rays are clamped to max_distance
+        """
+        ray_caster = self._ray_casters[robot_index]
+        
+        # Check if data exists and has correct shape
+        if hasattr(ray_caster.data, 'ray_distances') and ray_caster.data.ray_distances is not None:
+            ray_distances = ray_caster.data.ray_distances  # Shape: (num_envs, num_rays)
+            
+            # Handle invalid rays (rays that didn't hit anything)
+            # Invalid rays return -1.0, replace with max_distance
+            ray_distances = torch.where(
+                ray_distances < 0.0,
+                torch.full_like(ray_distances, self.cfg.ray_max_distance),
+                ray_distances
+            )
+            
+            # Clamp to valid range [0, max_distance]
+            ray_distances = torch.clamp(ray_distances, 0.0, self.cfg.ray_max_distance)
+        else:
+            # ✅ FALLBACK: If sensor not ready, return max distances
+            ray_distances = torch.full(
+                (self.num_envs, self.cfg.num_rays), 
+                self.cfg.ray_max_distance, 
+                device=self.device
+            )
+        
+        return ray_distances
+
     def _get_observations(self) -> dict:
         """Get observations for each drone including RayCaster distances.
         
@@ -233,21 +292,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[:, j, :]
             )
             
-            # Get RayCaster distances (CORRECTED)
-            ray_caster = self._ray_casters[j]
-            ray_distances = ray_caster.data.ray_distances  # ✅ Use ray_distances, not ray_hits_w
-            # Shape: (num_envs, num_rays)
-            
-            # Handle invalid rays (rays that didn't hit anything)
-            # Invalid rays return -1.0, clamp them to max_distance
-            ray_distances = torch.where(
-                ray_distances < 0.0,
-                torch.full_like(ray_distances, self.cfg.ray_max_distance),
-                ray_distances
-            )
-            
-            # Clamp to valid range [0, max_distance]
-            ray_distances = torch.clamp(ray_distances, 0.0, self.cfg.ray_max_distance)
+            # Get RayCaster distances using helper function
+            ray_distances = self._get_raycaster_data(j)  # Shape: (num_envs, num_rays)
             
             # Concatenate observation components
             obs_j = torch.cat(
@@ -282,20 +328,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[:, j, :]
             )
             
-            # Get RayCaster distances (CORRECTED)
-            ray_caster = self._ray_casters[j]
-            ray_distances = ray_caster.data.ray_distances  # ✅ Use ray_distances
-            # Shape: (num_envs, num_rays)
-            
-            # Handle invalid rays
-            ray_distances = torch.where(
-                ray_distances < 0.0,
-                torch.full_like(ray_distances, self.cfg.ray_max_distance),
-                ray_distances
-            )
-            
-            # Clamp to valid range
-            ray_distances = torch.clamp(ray_distances, 0.0, self.cfg.ray_max_distance)
+            # Get RayCaster distances using helper function
+            ray_distances = self._get_raycaster_data(j)  # Shape: (num_envs, num_rays)
             
             # Same observation components as individual observations
             obs_j = torch.cat(
@@ -315,7 +349,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         state = torch.cat(state_list, dim=-1)  # (num_envs, num_agents * (12 + num_rays))
         
         return state
-
+    
     ##TODO : adjust rewards weights and terms based on current stage in the curriculum
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         """Calculate rewards matching copy_quadenv.py logic + swarm terms.
@@ -540,6 +574,28 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         if env_ids is None or len(env_ids) == self.num_envs:
             env_ids = self._robots[0]._ALL_INDICES
 
+
+            # ✅ DEBUG: Check sensor buffer sizes BEFORE reset
+        print(f"\n[DEBUG] _reset_idx called:")
+        print(f"  env_ids: {env_ids}")
+        print(f"  num_envs: {self.num_envs}")
+        print(f"  env_ids.max(): {env_ids.max()}")
+        
+        for i, sensor in enumerate(self._ray_casters):
+            print(f"\n[DEBUG] RayCaster {i}:")
+            print(f"  num_instances: {sensor.num_instances}")
+            print(f"  _timestamp_last_update.shape: {sensor._timestamp_last_update.shape}")
+            print(f"  prim_path: {sensor.cfg.prim_path}")
+            
+            # ✅ Check if buffer size matches num_envs
+            if sensor._timestamp_last_update.shape[0] != self.num_envs:
+                raise RuntimeError(
+                    f"RayCaster {i} buffer size mismatch!\n"
+                    f"  Expected: {self.num_envs}\n"
+                    f"  Got: {sensor._timestamp_last_update.shape}\n"
+                    f"  This will cause CUDA indexing errors."
+                )
+
         # -----------------------------------------------------
         # 1. LOG EPISODIC METRICS (same from your code)
         # -----------------------------------------------------
@@ -751,7 +807,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         - Obstacle 2: Offset to left
         - Obstacle 3: Offset to right
         
-        This forces agents to learn lateral maneuvering (zig-zag movement).
+        Obstacles are indexed from 0 to (num_agents * 3 - 1) for unified RayCaster detection.
         """
         from isaaclab.sim.spawners.shapes import CuboidCfg
         from isaaclab.sim.schemas.schemas_cfg import (
@@ -775,6 +831,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Starting X position for obstacle course
         course_start_x = stage3_offset[0] + 3.0
         
+        # Global obstacle index counter (starts at 0 for stage 3)
+        global_wall_idx = 0
+        
         # Build obstacles for each agent
         for agent_idx in range(self.num_drones):
             # Calculate agent's lane center (Y coordinate)
@@ -795,8 +854,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 
                 obs_z = base_height
                 
-                # Create obstacle prim
-                wall_path = f"/World/envs/env_{source_env_idx}/Stage3_Agent{agent_idx}_Obs{obs_idx}"
+                # Create obstacle prim with unified naming scheme
+                wall_path = f"/World/envs/env_{source_env_idx}/obstacles/wall_{global_wall_idx}"
                 wall_cfg = CuboidCfg(
                     size=obstacle_size,
                     rigid_props=RigidBodyPropertiesCfg(
@@ -806,15 +865,19 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                     ),
                     collision_props=CollisionPropertiesCfg(collision_enabled=True),
                     visual_material=PreviewSurfaceCfg(
-                        diffuse_color=(0.9, 0.1, 0.1),
+                        diffuse_color=(0.9, 0.1, 0.1),  # Red for stage 3
                         roughness=0.4,
                         metallic=0.0,
                     ),
                 )
                 wall_cfg.func(wall_path, wall_cfg, translation=(obs_x, obs_y, obs_z))
+                
+                # Increment global index
+                global_wall_idx += 1
         
         print(f"[INFO] Built Stage 3 obstacle course:")
         print(f"  - {self.num_drones} agents × 3 obstacles = {self.num_drones * 3} total obstacles")
+        print(f"  - Obstacle indices: 0 to {self.num_drones * 3 - 1}")
         print(f"  - Zig-zag pattern with {obstacle_spacing_x}m spacing")
 
     def _build_stage5_obstacles(self):
@@ -824,7 +887,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         - Bottom X: 3 walls (left, center, right)
         - Top X: 5 walls (full X pattern)
         
-        This forces swarm to navigate through strategic gaps while maintaining formation.
+        Obstacles are indexed starting from (num_agents * 3) to allow unified RayCaster detection.
         """
         from isaaclab.sim.spawners.shapes import CuboidCfg
         from isaaclab.sim.schemas.schemas_cfg import (
@@ -843,39 +906,37 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Obstacle size: vertical walls blocking Y-axis travel
         obstacle_size = (1.2, 0.2, 5)  # (length, thickness, height)
         base_height = 2.5
-        dist_from_spawn_swarm = self.cfg.curriculum.dist_from_spawn_swarm  # Distance from swarm spawn area to obstacle pattern
+        dist_from_spawn_swarm = self.cfg.curriculum.dist_from_spawn_swarm
+        
         # Base Y position for the pattern
-        base_y = stage5_offset[1]+dist_from_spawn_swarm
+        base_y = stage5_offset[1] + dist_from_spawn_swarm
         base_x = stage5_offset[0]
         
         # Calculate wall positions based on stacked X pattern
-        # Pattern layout (Y increases upward):
-        #
-        #     wall7        wall8         (Y = base + 2*y_offset)
-        #           wall6               (Y = base + 1.5*y_offset) - center top X
-        #     wall4        wall5         (Y = base + y_offset)
-        #           wall3               (Y = base + 0.5*y_offset) - center bottom X
-        #     wall1  wall2               (Y = base)
-        
         wall_positions = [
             # Bottom X base (3 walls)
-            (base_x - x_offset, base_y, base_height),              # wall1 - left bottom
-            (base_x + x_offset, base_y, base_height),              # wall2 - right bottom
-            (base_x, base_y + 0.5 * y_offset, base_height),        # wall3 - center bottom
+            (base_x - x_offset, base_y, base_height),              # wall0 - left bottom
+            (base_x + x_offset, base_y, base_height),              # wall1 - right bottom
+            (base_x, base_y + 0.5 * y_offset, base_height),        # wall2 - center bottom
             
             # Middle layer (2 walls)
-            (base_x - x_offset, base_y + y_offset, base_height),   # wall4 - left middle
-            (base_x + x_offset, base_y + y_offset, base_height),   # wall5 - right middle
+            (base_x - x_offset, base_y + y_offset, base_height),   # wall3 - left middle
+            (base_x + x_offset, base_y + y_offset, base_height),   # wall4 - right middle
             
             # Top X (3 walls)
-            (base_x, base_y + 1.5 * y_offset, base_height),        # wall6 - center top
-            (base_x - x_offset, base_y + 2 * y_offset, base_height), # wall7 - left top
-            (base_x + x_offset, base_y + 2 * y_offset, base_height), # wall8 - right top
+            (base_x, base_y + 1.5 * y_offset, base_height),        # wall5 - center top
+            (base_x - x_offset, base_y + 2 * y_offset, base_height), # wall6 - left top
+            (base_x + x_offset, base_y + 2 * y_offset, base_height), # wall7 - right top
         ]
         
+        # Global obstacle index starts after stage 3 obstacles
+        stage5_start_idx = self.num_drones * 3
+        
         # Build all 8 wall segments
-        for wall_idx, (wall_x, wall_y, wall_z) in enumerate(wall_positions):
-            wall_path = f"/World/envs/env_{source_env_idx}/WallSegment_Stage5_{wall_idx}"
+        for local_idx, (wall_x, wall_y, wall_z) in enumerate(wall_positions):
+            global_wall_idx = stage5_start_idx + local_idx
+            
+            wall_path = f"/World/envs/env_{source_env_idx}/obstacles/wall_{global_wall_idx}"
             wall_cfg = CuboidCfg(
                 size=obstacle_size,
                 rigid_props=RigidBodyPropertiesCfg(
@@ -885,7 +946,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 ),
                 collision_props=CollisionPropertiesCfg(collision_enabled=True),
                 visual_material=PreviewSurfaceCfg(
-                    diffuse_color=(0.1, 0.1, 0.9),
+                    diffuse_color=(0.1, 0.1, 0.9),  # Blue for stage 5
                     roughness=0.4,
                     metallic=0.0,
                 ),
@@ -894,6 +955,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         print(f"[INFO] Built Stage 5 stacked X obstacle pattern:")
         print(f"  - 8 wall segments in X formation")
+        print(f"  - Obstacle indices: {stage5_start_idx} to {stage5_start_idx + 7}")
         print(f"  - X offset: {x_offset}m, Y offset: {y_offset}m")
         print(f"  - Base position: ({base_x}, {base_y})")
     
