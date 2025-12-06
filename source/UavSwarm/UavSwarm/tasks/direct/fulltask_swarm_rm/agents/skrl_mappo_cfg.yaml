@@ -7,15 +7,15 @@ models:
   separate: True
   policy:  # see gaussian_model parameters
     class: GaussianMixin
-    clip_actions: False
+    clip_actions: True  # ✅ Changed to True - prevents extreme actions
     clip_log_std: True
     min_log_std: -20.0
     max_log_std: 2.0
-    initial_log_std: 0.0
+    initial_log_std: 0.0  # ✅ Start with moderate exploration
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [64, 64, 32]  # ✅ Deeper network for complex RM state reasoning
         activations: elu
     output: ACTIONS
   value:  # see deterministic_model parameters
@@ -24,7 +24,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [32, 32]
+        layers: [64, 64, 32]  # ✅ Match policy network depth
         activations: elu
     output: ONE
 
@@ -40,43 +40,43 @@ memory:
 # https://skrl.readthedocs.io/en/latest/api/multi_agents/mappo.html
 agent:
   class: MAPPO
-  rollouts: 16
-  learning_epochs: 8
-  mini_batches: 1
+  rollouts: 64  # ✅ Increased from 16 - more data per update for stable curriculum learning
+  learning_epochs: 10  # ✅ Increased from 8 - better policy refinement per batch
+  mini_batches: 4  # ✅ Increased from 1 - more gradient updates per epoch
   discount_factor: 0.99
-  lambda: 0.95
+  lambda: 0.95  # GAE lambda for advantage estimation
   learning_rate: 3.0e-04
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008
+    kl_threshold: 0.01  # ✅ Slightly increased from 0.008 - allows larger policy updates
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
-  shared_state_preprocessor: RunningStandardScaler
+  shared_state_preprocessor: RunningStandardScaler  # ✅ Important for MARL coordination
   shared_state_preprocessor_kwargs: null
   value_preprocessor: RunningStandardScaler
   value_preprocessor_kwargs: null
   random_timesteps: 0
   learning_starts: 0
-  grad_norm_clip: 1.0
+  grad_norm_clip: 0.5  # ✅ Reduced from 1.0 - prevent gradient explosions with RM state transitions
   ratio_clip: 0.2
   value_clip: 0.2
   clip_predicted_values: True
-  entropy_loss_scale: 0.0
-  value_loss_scale: 2.0
+  entropy_loss_scale: 0.01  # ✅ Increased from 0.0 - encourage exploration of RM states
+  value_loss_scale: 1.0  # ✅ Reduced from 2.0 - balance policy and value learning
   kl_threshold: 0.0
   rewards_shaper_scale: 1.0
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "hover_mappo_v3"
+    directory: "fulltask_swarm_rm_mappo_v1"
     experiment_name: ""
-    write_interval: auto
-    checkpoint_interval: auto
+    write_interval: 500  # ✅ Changed from auto - log every 500 steps
+    checkpoint_interval: 5000  # ✅ Changed from auto - save every 5000 steps
 
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 30000
+  timesteps: 2000000  # ✅ Increased from 30000 - curriculum learning needs more time
   environment_info: log

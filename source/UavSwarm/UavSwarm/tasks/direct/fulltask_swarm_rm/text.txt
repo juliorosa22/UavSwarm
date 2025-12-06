@@ -19,9 +19,17 @@
   switch(agent_state)
     case 'H':
         if agent_z > hover_min_z: agent_state='SM'
-    case 'SM':
+    case 'S':
         if agent_obstacle_distance < close_obs_dist: agent_state = 'OM'    
         if agent_neighbor_dist < max_neighbor_distance: agent_state='CM'
-    case 'CM':
-    case 'OM':
-        if agent_obstacle_distance > close_obs_dist: agent_state = 'SM'    
+    case 'C':
+    case 'O':
+        if agent_obstacle_distance > close_obs_dist: agent_state = 'SM'  
+
+fun switch_rm_state(agent)
+    if agent_z > hover_min{
+        if agent_obstacle_distance > close_obs_dist_thresh{
+            if agent_neighbor_dist < max_neighbor_distance: agent_state = 'C'
+            else agent_state = 'S'
+        }else agent_state = 'O'
+    } else agent_state = 'H'

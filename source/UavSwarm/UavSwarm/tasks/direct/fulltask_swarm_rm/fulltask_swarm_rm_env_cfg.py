@@ -48,21 +48,26 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 @configclass
 class CurriculumCfg:
     # total training horizon (for reference)
-    total_steps: int = 5000
+    total_steps: int = 2_500_000
 
     # boundaries between stages (in environment steps)
-    stage1_end: int = 1000#1_000_000   # Hovering
-    stage2_end: int = 2000#4_000_000   # Point-to-point
-    stage3_end: int = 3000#7_000_000   # Obstacle navigation
-    stage4_end: int = 4000#8_000_000   # Swarm navigation
-    stage5_end: int = 5000#10_000_000  # Swarm + obstacles (final)
+    stage1_end: int = 300_000#1_000_000   # Hovering
+    stage2_end: int = 700_000#4_000_000   # Point-to-point
+    stage3_end: int = 1_200_000#7_000_000   # Obstacle navigation
+    stage4_end: int = 1_800_000#8_000_000   # Swarm navigation
+    stage5_end: int = 2_500_000#10_000_000  # Swarm + obstacles (final)
     ##-- Separation spawan origins based on stages --
     # Stage-specific spatial offsets (where agents spawn)
     # Stages 1, 2, 4: origin at (0, 0)
     # Stage 3: origin at (stage3_offset_x, stage3_offset_y) where obstacles are
     # Stage 5: origin at (stage5_offset_x, stage5_offset_y) where obstacles are
     
-
+# ✅ NEW: Episode durations per stage
+    stage1_episode_length_s: float = 30.0   # Hover
+    stage2_episode_length_s: float = 40.0   # Point-to-point
+    stage3_episode_length_s: float = 90.0   # Obstacles
+    stage4_episode_length_s: float = 60.0   # Swarm
+    stage5_episode_length_s: float = 120.0  # Swarm + obstacles
 
     ##--- Stage 2 parameters ---##
     stage2_goal_distance:float = 10.0  # xy-distance for point-to-point and obstacle navigation stages
@@ -80,7 +85,7 @@ class CurriculumCfg:
 
     ##--- Stage 5 parameters ---##
     stage5_offset_x: float = 0.0   # Keep X centered for stage 5
-    stage5_offset_y: float = 20.0  # Move agents 20m in Y for stage 5
+    stage5_offset_y: float = 15.0  # Move agents 15m in Y for stage 5
     # Stage 5 obstacle distribution (stacked X pattern)
     stage5_obsx_offset: float = 2.0  # X spacing between wall segments in X pattern
     stage5_obsy_offset: float = 3.0  # Y spacing between wall segments in X pattern
@@ -88,7 +93,7 @@ class CurriculumCfg:
     ##--- Common parameters ---##
     spawn_height_range: tuple = (0.5, 0.8)  # spawn height range for all stages
     spawn_grid_spacing_range: tuple = (0.5, 1.0)  # spacing range for grid spawn positions 
-    goal_height_range: tuple = (3.0, 20.0)  # goal height range for all stages
+    goal_height_range: tuple = (2.0, 10.0)  # goal height range for all stages
 
 
 @configclass
@@ -115,6 +120,17 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     hover_min_altitude: float = 1  # Minimum altitude to exit hovering state
     close_obs_dist_thresh: float = 2.0  # Distance threshold to enter obstacle-avoiding state
     num_rm_states: int = 4  # Number of RM states
+
+    # ✅ NEW: Termination thresholds
+    min_flight_height: float = 0.1  # Minimum safe altitude (meters)
+    max_flight_height: float = 15.0  # Maximum safe altitude (meters)
+    max_distance_from_origin: float = 50.0  # Maximum XY distance from env origin (meters)
+    
+    # ✅ NEW: Goal reaching thresholds (stage-dependent)
+    hover_position_threshold: float = 0.15  # Stage 1: Position error for hover (meters)
+    hover_velocity_threshold: float = 0.2   # Stage 1: Velocity threshold for stable hover (m/s)
+    goal_position_threshold: float = 0.5    # Stages 2-3: Position threshold for goals (meters)
+    swarm_goal_threshold: float = 1.0      # Stages 4-5: Formation goal threshold (meters)
 
 
     # ✅ REBALANCED BASE REWARD SCALES
@@ -147,7 +163,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     # Required for DirectMARLEnvCfg - using robot names as keys
     possible_agents = [f"robot_{i}" for i in range(num_agents)]
     action_spaces = {f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)}
-    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(num_agents)}
+    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(23,)) for i in range(num_agents)}
     
     
     debug_vis = True
@@ -186,7 +202,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=5, env_spacing=50.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=2048, env_spacing=50.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----
@@ -245,7 +261,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     
     # Spawn and hover heights
     spawn_height_range = (0.5, 0.8)      # Random spawn height range
-    hover_height_offset = 1            # Offset from spawn to goal height
+    
     
     # Safety constraints
     min_sep = 0.6                        # Minimum separation distance between drones
