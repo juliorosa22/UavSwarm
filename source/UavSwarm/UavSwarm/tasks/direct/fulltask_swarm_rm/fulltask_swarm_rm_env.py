@@ -438,75 +438,223 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         return state
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        """Fully vectorized reward calculation."""
+        """RM state-aware reward calculation with behavior-specific guidance.
+        
+        Strategy:
+        1. Compute individual reward for each drone based on its RM state
+        2. Use minimum reward across all drones (cooperative worst-case)
+        3. Main term: distance penalty (negative, approaches 0 as agent reaches goal)
+        4. RM state-specific shaping to guide learning behavior
+        
+        RM State Behaviors:
+        - State 0 (Hovering): Prioritize Z-axis movement to gain altitude
+        - State 1 (Single-moving): Prioritize smooth XY movement, avoid abrupt changes
+        - State 2 (Coop-moving): Same as State 1 + neighbor coordination
+        - State 3 (Obstacle-avoiding): Allow aggressive maneuvers, reduce penalties
+        """
         
         # Stack all robot data: (num_drones, num_envs, 3)
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
         all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
         all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
-        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
         
-        # Base velocity penalties (vectorized)
-        lin_vel_sq = torch.sum(all_lin_vels ** 2, dim=2)  # (num_drones, num_envs)
-        ang_vel_sq = torch.sum(all_ang_vels ** 2, dim=2)  # (num_drones, num_envs)
+        # ========================================
+        # 1. COMPUTE INDIVIDUAL DRONE REWARDS
+        # ========================================
+        individual_rewards = torch.zeros(self.num_drones, self.num_envs, device=self.device)
         
-        # State-dependent scaling (vectorized)
-        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
-        is_hovering = (self._rm_states.transpose(0, 1) == 0).float()  # (num_drones, num_envs)
-        vel_scale = 1.0 + 0.5 * is_hovering
+        # Get RM states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
+        rm_states = self._rm_states.transpose(0, 1)
         
-        # Apply penalties
-        lin_vel_sum = (lin_vel_sq * vel_scale).sum(dim=0) * self.cfg.reward_cfg.lin_vel_reward_scale * self.step_dt
-        ang_vel_sum = (ang_vel_sq * vel_scale).sum(dim=0) * self.cfg.reward_cfg.ang_vel_reward_scale * self.step_dt
-        
-        # Distance to goal (vectorized)
-        # _desired_pos_w: (num_envs, num_drones, 3) -> transpose -> (num_drones, num_envs, 3)
+        # Goal positions transposed: (num_drones, num_envs, 3)
         desired_transposed = self._desired_pos_w.transpose(0, 1)
-        distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
-        distance_mapped = 1 - torch.tanh(distances / 0.8)
-        dist_goal_sum = distance_mapped.sum(dim=0) * self.cfg.reward_cfg.distance_to_goal_reward_scale * self.step_dt
         
-        # Formation penalties (already vectorized)
+        for drone_idx in range(self.num_drones):
+            # Extract drone-specific data
+            drone_pos = all_positions[drone_idx]  # (num_envs, 3)
+            drone_lin_vel = all_lin_vels[drone_idx]  # (num_envs, 3)
+            drone_ang_vel = all_ang_vels[drone_idx]  # (num_envs, 3)
+            drone_goal = desired_transposed[drone_idx]  # (num_envs, 3)
+            drone_rm_state = rm_states[drone_idx]  # (num_envs,)
+            
+            # -----------------------------------------------------
+            # 1.1 MAIN TERM: DISTANCE PENALTY (ALL STATES)
+            # -----------------------------------------------------
+            distance = torch.linalg.norm(drone_goal - drone_pos, dim=1)  # (num_envs,)
+            distance_penalty = -distance * 0.5  # ✅ REDUCED from 1.0 for better balance
+            
+            # -----------------------------------------------------
+            # 1.2 RM STATE-SPECIFIC SHAPING REWARDS
+            # -----------------------------------------------------
+            # Create state masks
+            is_hovering = (drone_rm_state == 0)  # (num_envs,)
+            is_single_moving = (drone_rm_state == 1)
+            is_coop_moving = (drone_rm_state == 2)
+            is_avoiding = (drone_rm_state == 3)
+            
+            # ✅ STATE 0 (HOVERING): Prioritize Z-axis movement to gain altitude
+            # Reward vertical progress, penalize horizontal drift
+            z_error = torch.abs(drone_goal[:, 2] - drone_pos[:, 2])  # Vertical distance
+            xy_drift = torch.linalg.norm(drone_goal[:, :2] - drone_pos[:, :2], dim=1)  # Horizontal drift
+            
+            # Reward for reducing Z error (encourage altitude gain)
+            z_progress_reward = -z_error * 0.3 * is_hovering.float()
+            
+            # Penalty for XY drift when hovering (should stay in place horizontally)
+            xy_drift_penalty = -xy_drift * 0.2 * is_hovering.float()
+            
+            # Heavy penalty for excessive velocity when hovering (should be still)
+            hover_vel_penalty = -torch.sum(drone_lin_vel ** 2, dim=1) * 0.03 * is_hovering.float()
+            
+            # ✅ STATE 1 (SINGLE-MOVING): Smooth movement, avoid abrupt changes
+            # Penalize high accelerations (sudden velocity changes)
+            # Compute velocity magnitude
+            vel_magnitude = torch.linalg.norm(drone_lin_vel, dim=1)  # (num_envs,)
+            
+            # Penalize excessive velocity (encourage smooth flight)
+            smooth_vel_penalty = -torch.clamp(vel_magnitude - 1.0, min=0.0) * 0.1 * is_single_moving.float()
+            
+            # Penalize angular velocity (avoid spinning/oscillation)
+            smooth_ang_penalty = -torch.sum(drone_ang_vel ** 2, dim=1) * 0.01 * is_single_moving.float()
+            
+            # ✅ STATE 2 (COOP-MOVING): Same as State 1 + neighbor coordination
+            # Reuse smooth movement penalties
+            coop_vel_penalty = -torch.clamp(vel_magnitude - 1.0, min=0.0) * 0.1 * is_coop_moving.float()
+            coop_ang_penalty = -torch.sum(drone_ang_vel ** 2, dim=1) * 0.01 * is_coop_moving.float()
+            
+            # Additional neighbor coordination reward (only in stages 4-5)
+            neighbor_bonus = torch.zeros(self.num_envs, device=self.device)
+            if self.curriculum_stage in [4, 5]:
+                # Get neighbor data (vectorized version recommended for efficiency)
+                # For now, using placeholder - replace with actual neighbor distance computation
+                # This should reward maintaining optimal distance to nearest neighbor
+                
+                # Placeholder: reward proximity to ideal neighbor distance
+                # ideal_neighbor_dist = self.cfg.swarm_cfg.max_neighbor_distance / 2.0
+                # actual_neighbor_dist = ... (compute from all_positions)
+                # neighbor_error = torch.abs(actual_neighbor_dist - ideal_neighbor_dist)
+                # neighbor_bonus = -neighbor_error * 0.05 * is_coop_moving.float()
+                pass  # ✅ Implement if needed based on your neighbor distance helper
+            
+            # ✅ STATE 3 (OBSTACLE-AVOIDING): Allow aggressive maneuvers
+            # Minimal penalties to allow complex trajectories
+            avoid_vel_penalty = -torch.sum(drone_lin_vel ** 2, dim=1) * 0.001 * is_avoiding.float()
+            avoid_ang_penalty = -torch.sum(drone_ang_vel ** 2, dim=1) * 0.0005 * is_avoiding.float()
+            
+            # Bonus for maintaining safe distance from obstacles
+            obstacle_clearance_bonus = torch.zeros(self.num_envs, device=self.device)
+            if self.curriculum_stage in [3, 5]:
+                # Get nearest obstacle distance
+                obstacle_dist = self._get_nearest_obstacle_distance_vectorized(
+                    all_positions
+                )[drone_idx]  # (num_envs,)
+                
+                # Reward staying above minimum safe distance (1.0m)
+                safe_threshold = 1.0
+                clearance_ratio = torch.clamp(obstacle_dist / safe_threshold, 0.0, 1.0)
+                obstacle_clearance_bonus = clearance_ratio * 0.1 * is_avoiding.float()
+            
+            # -----------------------------------------------------
+            # 1.3 COLLISION PENALTY (ALL STATES)
+            # -----------------------------------------------------
+            drone_z = drone_pos[:, 2]  # (num_envs,)
+            
+            too_low = drone_z < self.cfg.reward_cfg.min_flight_height
+            too_high = drone_z > self.cfg.reward_cfg.max_flight_height
+            collision_penalty = -(too_low | too_high).float() * 5.0  # ✅ REDUCED from 10.0
+            
+            # -----------------------------------------------------
+            # 1.4 COMBINE INDIVIDUAL REWARD
+            # -----------------------------------------------------
+            individual_rewards[drone_idx] = (
+                # MAIN TERM (applies to all states)
+                distance_penalty +              # -0.5 * distance (main objective)
+                
+                # STATE 0 (HOVERING): Z-axis focus
+                z_progress_reward +             # Encourage altitude gain
+                xy_drift_penalty +              # Discourage horizontal drift
+                hover_vel_penalty +             # Encourage stillness
+                
+                # STATE 1 (SINGLE-MOVING): Smooth movement
+                smooth_vel_penalty +            # Avoid high velocities
+                smooth_ang_penalty +            # Avoid spinning
+                
+                # STATE 2 (COOP-MOVING): Smooth + coordination
+                coop_vel_penalty +              # Same as State 1
+                coop_ang_penalty +              # Same as State 1
+                neighbor_bonus +                # Neighbor coordination (stages 4-5)
+                
+                # STATE 3 (OBSTACLE-AVOIDING): Minimal constraints
+                avoid_vel_penalty +             # Minimal velocity penalty
+                avoid_ang_penalty +             # Minimal angular penalty
+                obstacle_clearance_bonus +      # Reward safe distance
+                
+                # SAFETY (all states)
+                collision_penalty               # Avoid ground/ceiling
+            )
+        
+        # ========================================
+        # 2. SWARM-LEVEL PENALTIES (STAGES 4-5)
+        # ========================================
+        swarm_penalty = torch.zeros(self.num_envs, device=self.device)
+        
         if self.curriculum_stage in [4, 5]:
-            # Transpose to (num_envs, num_drones, 3)
-            positions = all_positions.transpose(0, 1)
+            positions = all_positions.transpose(0, 1)  # (num_envs, num_drones, 3)
             dmat = torch.cdist(positions, positions)
-            too_close = torch.clamp(self.cfg.swarm_cfg.min_safe_distance - dmat, min=0.0)
+            
+            # ✅ SMOOTH inter-agent collision gradient (not binary)
+            violations = torch.clamp(
+                self.cfg.swarm_cfg.min_safe_distance - dmat, 
+                min=0.0
+            )
+            eye_mask = torch.eye(self.num_drones, device=self.device).unsqueeze(0)
+            violations = violations * (1.0 - eye_mask)
+            collision_penalty_swarm = -violations.mean(dim=(1, 2)) * 2.0  # ✅ REDUCED from 5.0
+            
+            # Formation penalty
             mean_dist = torch.mean(dmat, dim=(1, 2))
-            formation_pen = self.cfg.reward_cfg.formation_penalty_scale * (
-                torch.mean(too_close, dim=(1, 2)) + 
-                torch.clamp(mean_dist - self.cfg.swarm_cfg.max_formation_distance, min=0.0)
-            ) * self.step_dt
-        else:
-            formation_pen = torch.zeros(self.num_envs, device=self.device)
+            formation_penalty = -torch.clamp(
+                mean_dist - self.cfg.swarm_cfg.max_formation_distance, 
+                min=0.0
+            ) * 0.2  # ✅ REDUCED from 0.5
+            
+            swarm_penalty = collision_penalty_swarm + formation_penalty
         
-        # Collision penalty (vectorized)
-        # all_positions: (num_drones, num_envs, 3) -> z-coords: (num_drones, num_envs)
+        # ========================================
+        # 3. USE MINIMUM REWARD (WORST-CASE OPTIMIZATION)
+        # ========================================
+        individual_rewards_T = individual_rewards.transpose(0, 1)  # (num_envs, num_drones)
+        min_reward = individual_rewards_T.min(dim=1)[0]  # (num_envs,)
+        
+        # ✅ REMOVED step_dt scaling for consistency
+        reward = min_reward + swarm_penalty
+        
+        # ========================================
+        # 4. LOGGING (for debugging)
+        # ========================================
+        avg_distance = torch.linalg.norm(
+            desired_transposed - all_positions, dim=2
+        ).mean(dim=0)
+        
+        self._episode_sums["distance_to_goal"] += avg_distance
+        
+        # Log average velocity penalties
+        avg_lin_vel = torch.sum(all_lin_vels ** 2, dim=2).mean(dim=0)
+        avg_ang_vel = torch.sum(all_ang_vels ** 2, dim=2).mean(dim=0)
+        
+        self._episode_sums["lin_vel"] += avg_lin_vel
+        self._episode_sums["ang_vel"] += avg_ang_vel
+        
+        # Log collision and formation
         agent_z = all_positions[:, :, 2]
-        collided = agent_z < 0.1  # (num_drones, num_envs)
-        collision_pen = self.cfg.reward_cfg.collision_penalty_scale * collided.any(dim=0).float() * self.step_dt
+        too_low = agent_z < self.cfg.reward_cfg.min_flight_height
+        too_high = agent_z > self.cfg.reward_cfg.max_flight_height
+        collision_log = -(too_low | too_high).any(dim=0).float() * 5.0
         
-        # RM state bonuses (vectorized)
-        altitude_bonus = self._compute_altitude_bonus_vectorized(all_positions, desired_transposed)
-        obstacle_bonus = self._compute_obstacle_bonus_vectorized(all_positions)
-        neighbor_bonus = self._compute_neighbor_bonus_vectorized(all_positions)
-        state_bonus = self._compute_state_bonus_vectorized()
-        
-        # Combine
-        reward = (
-            lin_vel_sum + ang_vel_sum + dist_goal_sum +
-            formation_pen + collision_pen +
-            altitude_bonus + obstacle_bonus + neighbor_bonus + state_bonus
-        )
-        
-        # Logging (vectorized)
-        self._episode_sums["lin_vel"] += lin_vel_sum
-        self._episode_sums["ang_vel"] += ang_vel_sum
-        self._episode_sums["distance_to_goal"] += dist_goal_sum
-        self._episode_sums["formation"] += formation_pen
-        self._episode_sums["collision"] += collision_pen
+        self._episode_sums["collision"] += collision_log
+        self._episode_sums["formation"] += swarm_penalty
         
         return {f"robot_{i}": reward for i in range(self.num_drones)}
-
 
 #------Disabled RayCaster related functions for now as the sensor is not stable yet with multiple obstacles and MARL envs.
     def _get_raycaster_data(self, robot_index: int) -> torch.Tensor:
