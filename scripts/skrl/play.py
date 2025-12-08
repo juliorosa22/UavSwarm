@@ -212,6 +212,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+
+  # ✅ FIXED: Warm-up phase - let simulation update visuals
+    print("[INFO] Warming up simulation for rendering...")
+    for _ in range(5):  # Run 5 steps to initialize rendering
+        # Use observation shape to create zero actions
+        if hasattr(env, "num_agents"):
+            # Multi-agent: create zero actions for each agent
+            zero_actions = {}
+            for agent_name in env.agents:
+                # Get action space from the wrapped environment
+                if hasattr(env.observation_space, "__getitem__"):
+                    action_shape = env.action_space[agent_name].shape
+                else:
+                    # Fallback: use observation to infer action space
+                    action_shape = obs[agent_name].shape[:-1] + (4,)
+                zero_actions[agent_name] = torch.zeros(action_shape, device=env.device)
+        else:
+            # Single-agent: create zero action
+            action_shape = obs.shape[:-1] + (4,)
+            zero_actions = torch.zeros(action_shape, device=env.device)
+        
+        env.step(zero_actions)
+        simulation_app.update()  # Force render update
+
+    print("[INFO] Starting policy rollout...")
+
+
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()

@@ -61,13 +61,18 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         self.num_drones = cfg.num_agents        
         self.global_step=0
-        self.curriculum_stage=1
+        
         self._obstacles_built=False
+        self.curriculum_stage = 1#cfg.curriculum.active_stage
+        
+        cfg.episode_length_s = cfg.curriculum.get_episode_length()
+        print(f"[INFO] Stage {cfg.curriculum.active_stage}: Episode length = {cfg.episode_length_s}s")
         # Initialize lists (before parent __init__)
+
+
         self._robots = []
         self._body_ids = []
-        # self._ray_casters = [] 
-        # Call parent constructor (triggers _setup_scene)
+        self._obstacle_positions=None
         super().__init__(cfg, render_mode, **kwargs)
         
         # Now device is available, initialize tensors
@@ -140,6 +145,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Debug visualization
         self.set_debug_vis(self.cfg.debug_vis)
 
+    ## MAIN ENVIRONMENT FUNCTIONS ##
+
     def _setup_scene(self):
         """Setup the scene with terrain and N robots per environment."""
         # Terrain
@@ -163,8 +170,16 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             
             #No more ray casters for now as they do not work properly with multiple obstacles and MARL envs
             
-        # Build obstacles (in source environment only)
-        self._build_all_obstacles()
+        # ✅ NEW: Build obstacles ONLY for active stage
+        if self.curriculum_stage == 3:
+            print("[INFO] Building Stage 3 obstacles at origin...")
+            self._build_stage3_obstacles_at_origin()
+        elif self.curriculum_stage == 5:
+            print("[INFO] Building Stage 5 obstacles at origin...")
+            self._build_stage5_obstacles_at_origin()
+        else:
+            print(f"[INFO] Stage {self.curriculum_stage} has no obstacles")
+        
 
         # ✅ Clone environments (will replicate sensors automatically)
         self.scene.clone_environments(copy_from_source=False)
@@ -185,8 +200,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             actions: Dictionary mapping agent names to action tensors.
                      Each tensor has shape (num_envs, action_dim)
         """
-        self.global_step += 1
-        self.update_curriculum_stage()
+        #self.global_step += 1
+        #self.update_curriculum_stage()
         # Update waypoint goals for stage 3
         if self.curriculum_stage == 3:
             self._update_waypoint_goals()
@@ -212,7 +227,6 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self._thrust[:, j, 0, 2] = self.cfg.thrust_to_weight * self._robot_weights[j] * thrust_cmd
             self._moment[:, j, 0, :] = self.cfg.moment_scale * self._actions[:, j, 1:]
 
-
     def _apply_action(self):
         """Apply forces and torques to each robot."""
         for j, rob in enumerate(self._robots):
@@ -221,9 +235,280 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._moment[:, j, :, :], 
                 body_ids=self._body_ids[j]
             )
-    # as in the link tutorial: For asymmetric policies, the dictionary should also include the key critic and the states buffer as the value.
-    
-    #------Disabled RayCaster related functions for now as the sensor is not stable yet with multiple obstacles and MARL envs.
+        
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+        """Reset environments with curriculum-dependent goals & scene adjustments."""
+        if env_ids is None or len(env_ids) == self.num_envs:
+            env_ids = self._robots[0]._ALL_INDICES
+
+        # -----------------------------------------------------
+        # 1. LOG EPISODIC METRICS (same from your code)
+        # -----------------------------------------------------
+        final_distances = []
+        for j in range(self.num_drones):
+            dist = torch.linalg.norm(
+                self._desired_pos_w[env_ids, j, :]
+                - self._robots[j].data.root_pos_w[env_ids],
+                dim=1,
+            )
+            final_distances.append(dist)
+        final_distance_to_goal = torch.stack(final_distances).mean()
+
+        # reward breakdown logs
+        log_dict = {}
+        for key in self._episode_sums.keys():
+            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
+            log_dict[f"Episode_Reward/{key}"] = episodic_sum_avg / self.max_episode_length_s
+            self._episode_sums[key][env_ids] = 0.0
+
+        # termination logs
+        log_dict["Episode_Termination/died"] = torch.count_nonzero(
+            self._last_terminated[env_ids]
+        ).item()
+        log_dict["Episode_Termination/time_out"] = torch.count_nonzero(
+            self._last_timed_out[env_ids]
+        ).item()
+        log_dict["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+
+        self.extras["log"] = log_dict
+
+        # reset termination state
+        self._last_terminated[env_ids] = False
+        self._last_timed_out[env_ids] = False
+
+        # -----------------------------------------------------
+        # 2. RESET ROBOTS TO DEFAULT STATE
+        # -----------------------------------------------------
+        for rob in self._robots:
+            rob.reset(env_ids)
+
+        super()._reset_idx(env_ids)
+
+        # desync episode starts
+        if len(env_ids) == self.num_envs:
+            self.episode_length_buf = torch.randint_like(
+                self.episode_length_buf, high=int(self.max_episode_length)
+            )
+
+        self._actions[env_ids] = 0.0
+        # ✅ NEW: Reset RM states to Hovering (0) for all agents
+        self._rm_states[env_ids, :] = 0
+        # -----------------------------------------------------
+        # 3. GET ENV ORIGINS
+        # -----------------------------------------------------
+        env_origins = self._terrain.env_origins[env_ids]
+
+        # -----------------------------------------------------
+        # 4. CURRICULUM LOGIC — SELECT THE RIGHT STAGE BEHAVIOR
+        # -----------------------------------------------------
+        # ✅ NEW: Only handle active stage (no offsets)
+        stage = self.curriculum_stage
+        
+        if stage == 1:
+            self._set_stage1_positions(env_ids, env_origins)
+        elif stage == 2:
+            self._set_stage2_positions(env_ids, env_origins)
+        elif stage == 3:
+            self._set_stage3_positions(env_ids, env_origins)
+        elif stage == 4:
+            self._set_stage4_positions(env_ids, env_origins)
+        elif stage == 5:
+            self._set_stage5_positions(env_ids, env_origins)
+
+    def _get_observations(self) -> dict:
+        """Fully vectorized observation generation."""
+        self._switch_rm_state()
+        
+        # Stack all robot data: (num_drones, num_envs, 3)
+        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
+        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
+        all_gravities = torch.stack([rob.data.projected_gravity_b for rob in self._robots], dim=0)
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
+        all_quats = torch.stack([rob.data.root_quat_w for rob in self._robots], dim=0)
+        
+        # Transform desired positions to body frame (vectorized for all agents)
+        # _desired_pos_w: (num_envs, num_drones, 3) -> transpose -> (num_drones, num_envs, 3)
+        desired_pos_w_transposed = self._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+        
+        # Vectorized frame transformation for all agents at once
+        desired_pos_b, _ = subtract_frame_transforms(
+            all_positions.reshape(-1, 3),  # (num_drones*num_envs, 3)
+            all_quats.reshape(-1, 4),
+            desired_pos_w_transposed.reshape(-1, 3)
+        )
+        desired_pos_b = desired_pos_b.reshape(self.num_drones, self.num_envs, 3)
+        
+        # Get obstacle distances (vectorized)
+        obstacle_dists = self._get_nearest_obstacle_distance_vectorized(all_positions)  # (num_drones, num_envs)
+        
+        # Get neighbor data (vectorized)
+        neighbor_rel_pos_b, neighbor_rel_vel_b = self._get_nearest_neighbor_data_vectorized(
+            all_positions, all_quats
+        )  # Each: (num_drones, num_envs, 3)
+        
+        # RM state one-hot encoding (vectorized)
+        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
+        rm_states_transposed = self._rm_states.transpose(0, 1)  # (num_drones, num_envs)
+        rm_state_onehot = torch.nn.functional.one_hot(
+            rm_states_transposed, 
+            num_classes=self.cfg.reward_cfg.num_rm_states
+        ).float()  # (num_drones, num_envs, 4)
+        
+        # Concatenate all observations: (num_drones, num_envs, 23)
+        all_obs = torch.cat([
+            all_lin_vels,                           # (num_drones, num_envs, 3)
+            all_ang_vels,                           # (num_drones, num_envs, 3)
+            all_gravities,                          # (num_drones, num_envs, 3)
+            desired_pos_b,                          # (num_drones, num_envs, 3)
+            obstacle_dists.unsqueeze(-1),           # (num_drones, num_envs, 1)
+            neighbor_rel_vel_b,                     # (num_drones, num_envs, 3)
+            neighbor_rel_pos_b,                     # (num_drones, num_envs, 3)
+            rm_state_onehot,                        # (num_drones, num_envs, 4)
+        ], dim=-1)  # (num_drones, num_envs, 23)
+        
+        # Convert to dictionary format (still need loop, but much faster than per-agent computation)
+        obs_dict = {}
+        for j in range(self.num_drones):
+            obs_dict[f"robot_{j}"] = all_obs[j]  # (num_envs, 23)
+        
+        return obs_dict
+
+    def _get_states(self) -> torch.Tensor:
+        """Get centralized state for MAPPO critic (fully vectorized).
+        
+        Returns:
+            Concatenated observations from all agents for centralized critic.
+            Shape: (num_envs, num_agents * obs_dim)
+        """
+        # ✅ REUSE observations already computed in _get_observations()
+        # Since _get_observations() is called before _get_states() in the environment step,
+        # we can reuse the vectorized computation
+        
+        # Stack all robot data: (num_drones, num_envs, 3)
+        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
+        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
+        all_gravities = torch.stack([rob.data.projected_gravity_b for rob in self._robots], dim=0)
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
+        all_quats = torch.stack([rob.data.root_quat_w for rob in self._robots], dim=0)
+        
+        # Transform desired positions to body frame (vectorized for all agents)
+        desired_pos_w_transposed = self._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+        
+        desired_pos_b, _ = subtract_frame_transforms(
+            all_positions.reshape(-1, 3),
+            all_quats.reshape(-1, 4),
+            desired_pos_w_transposed.reshape(-1, 3)
+        )
+        desired_pos_b = desired_pos_b.reshape(self.num_drones, self.num_envs, 3)
+        
+        # Get obstacle distances (vectorized)
+        obstacle_dists = self._get_nearest_obstacle_distance_vectorized(all_positions)
+        
+        # Get neighbor data (vectorized)
+        neighbor_rel_pos_b, neighbor_rel_vel_b = self._get_nearest_neighbor_data_vectorized(
+            all_positions, all_quats
+        )
+        
+        # RM state one-hot encoding (vectorized)
+        rm_states_transposed = self._rm_states.transpose(0, 1)
+        rm_state_onehot = torch.nn.functional.one_hot(
+            rm_states_transposed, 
+            num_classes=self.cfg.reward_cfg.num_rm_states
+        ).float()
+        
+        # Concatenate all observations: (num_drones, num_envs, 23)
+        all_obs = torch.cat([
+            all_lin_vels,
+            all_ang_vels,
+            all_gravities,
+            desired_pos_b,
+            obstacle_dists.unsqueeze(-1),
+            neighbor_rel_vel_b,
+            neighbor_rel_pos_b,
+            rm_state_onehot,
+        ], dim=-1)
+        
+        # ✅ VECTORIZED CONCATENATION: Reshape to (num_envs, num_agents * obs_dim)
+        # Transpose to (num_envs, num_drones, 23)
+        all_obs = all_obs.transpose(0, 1)
+        
+        # Flatten agents dimension: (num_envs, num_drones * 23)
+        state = all_obs.reshape(self.num_envs, -1)
+        
+        return state
+
+    def _get_rewards(self) -> dict[str, torch.Tensor]:
+        """Fully vectorized reward calculation."""
+        
+        # Stack all robot data: (num_drones, num_envs, 3)
+        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
+        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
+        
+        # Base velocity penalties (vectorized)
+        lin_vel_sq = torch.sum(all_lin_vels ** 2, dim=2)  # (num_drones, num_envs)
+        ang_vel_sq = torch.sum(all_ang_vels ** 2, dim=2)  # (num_drones, num_envs)
+        
+        # State-dependent scaling (vectorized)
+        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
+        is_hovering = (self._rm_states.transpose(0, 1) == 0).float()  # (num_drones, num_envs)
+        vel_scale = 1.0 + 0.5 * is_hovering
+        
+        # Apply penalties
+        lin_vel_sum = (lin_vel_sq * vel_scale).sum(dim=0) * self.cfg.reward_cfg.lin_vel_reward_scale * self.step_dt
+        ang_vel_sum = (ang_vel_sq * vel_scale).sum(dim=0) * self.cfg.reward_cfg.ang_vel_reward_scale * self.step_dt
+        
+        # Distance to goal (vectorized)
+        # _desired_pos_w: (num_envs, num_drones, 3) -> transpose -> (num_drones, num_envs, 3)
+        desired_transposed = self._desired_pos_w.transpose(0, 1)
+        distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
+        distance_mapped = 1 - torch.tanh(distances / 0.8)
+        dist_goal_sum = distance_mapped.sum(dim=0) * self.cfg.reward_cfg.distance_to_goal_reward_scale * self.step_dt
+        
+        # Formation penalties (already vectorized)
+        if self.curriculum_stage in [4, 5]:
+            # Transpose to (num_envs, num_drones, 3)
+            positions = all_positions.transpose(0, 1)
+            dmat = torch.cdist(positions, positions)
+            too_close = torch.clamp(self.cfg.swarm_cfg.min_safe_distance - dmat, min=0.0)
+            mean_dist = torch.mean(dmat, dim=(1, 2))
+            formation_pen = self.cfg.reward_cfg.formation_penalty_scale * (
+                torch.mean(too_close, dim=(1, 2)) + 
+                torch.clamp(mean_dist - self.cfg.swarm_cfg.max_formation_distance, min=0.0)
+            ) * self.step_dt
+        else:
+            formation_pen = torch.zeros(self.num_envs, device=self.device)
+        
+        # Collision penalty (vectorized)
+        # all_positions: (num_drones, num_envs, 3) -> z-coords: (num_drones, num_envs)
+        agent_z = all_positions[:, :, 2]
+        collided = agent_z < 0.1  # (num_drones, num_envs)
+        collision_pen = self.cfg.reward_cfg.collision_penalty_scale * collided.any(dim=0).float() * self.step_dt
+        
+        # RM state bonuses (vectorized)
+        altitude_bonus = self._compute_altitude_bonus_vectorized(all_positions, desired_transposed)
+        obstacle_bonus = self._compute_obstacle_bonus_vectorized(all_positions)
+        neighbor_bonus = self._compute_neighbor_bonus_vectorized(all_positions)
+        state_bonus = self._compute_state_bonus_vectorized()
+        
+        # Combine
+        reward = (
+            lin_vel_sum + ang_vel_sum + dist_goal_sum +
+            formation_pen + collision_pen +
+            altitude_bonus + obstacle_bonus + neighbor_bonus + state_bonus
+        )
+        
+        # Logging (vectorized)
+        self._episode_sums["lin_vel"] += lin_vel_sum
+        self._episode_sums["ang_vel"] += ang_vel_sum
+        self._episode_sums["distance_to_goal"] += dist_goal_sum
+        self._episode_sums["formation"] += formation_pen
+        self._episode_sums["collision"] += collision_pen
+        
+        return {f"robot_{i}": reward for i in range(self.num_drones)}
+
+
+#------Disabled RayCaster related functions for now as the sensor is not stable yet with multiple obstacles and MARL envs.
     def _get_raycaster_data(self, robot_index: int) -> torch.Tensor:
         """Get RayCaster distance measurements for a specific robot.
         
@@ -308,7 +593,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # One-hot encoding: (num_envs, 4)
         rm_state_onehot = torch.nn.functional.one_hot(
             self._rm_states[:, robot_idx], 
-            num_classes=self.cfg.num_rm_states
+            num_classes=self.cfg.reward_cfg.num_rm_states
         ).float()  # (num_envs, 4)
         
         # Concatenate observation components
@@ -327,7 +612,6 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         )  # -> (num_envs, 23)
         
         return obs
-
 
     def _get_observations_slow(self) -> dict:
         """Get observations for each drone including RM state (one-hot encoded).
@@ -382,130 +666,6 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
 
         return obs_dict
     
-    def _get_observations(self) -> dict:
-        """Fully vectorized observation generation."""
-        self._switch_rm_state()
-        
-        # Stack all robot data: (num_drones, num_envs, 3)
-        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
-        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
-        all_gravities = torch.stack([rob.data.projected_gravity_b for rob in self._robots], dim=0)
-        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
-        all_quats = torch.stack([rob.data.root_quat_w for rob in self._robots], dim=0)
-        
-        # Transform desired positions to body frame (vectorized for all agents)
-        # _desired_pos_w: (num_envs, num_drones, 3) -> transpose -> (num_drones, num_envs, 3)
-        desired_pos_w_transposed = self._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
-        
-        # Vectorized frame transformation for all agents at once
-        desired_pos_b, _ = subtract_frame_transforms(
-            all_positions.reshape(-1, 3),  # (num_drones*num_envs, 3)
-            all_quats.reshape(-1, 4),
-            desired_pos_w_transposed.reshape(-1, 3)
-        )
-        desired_pos_b = desired_pos_b.reshape(self.num_drones, self.num_envs, 3)
-        
-        # Get obstacle distances (vectorized)
-        obstacle_dists = self._get_nearest_obstacle_distance_vectorized(all_positions)  # (num_drones, num_envs)
-        
-        # Get neighbor data (vectorized)
-        neighbor_rel_pos_b, neighbor_rel_vel_b = self._get_nearest_neighbor_data_vectorized(
-            all_positions, all_quats
-        )  # Each: (num_drones, num_envs, 3)
-        
-        # RM state one-hot encoding (vectorized)
-        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
-        rm_states_transposed = self._rm_states.transpose(0, 1)  # (num_drones, num_envs)
-        rm_state_onehot = torch.nn.functional.one_hot(
-            rm_states_transposed, 
-            num_classes=self.cfg.num_rm_states
-        ).float()  # (num_drones, num_envs, 4)
-        
-        # Concatenate all observations: (num_drones, num_envs, 23)
-        all_obs = torch.cat([
-            all_lin_vels,                           # (num_drones, num_envs, 3)
-            all_ang_vels,                           # (num_drones, num_envs, 3)
-            all_gravities,                          # (num_drones, num_envs, 3)
-            desired_pos_b,                          # (num_drones, num_envs, 3)
-            obstacle_dists.unsqueeze(-1),           # (num_drones, num_envs, 1)
-            neighbor_rel_vel_b,                     # (num_drones, num_envs, 3)
-            neighbor_rel_pos_b,                     # (num_drones, num_envs, 3)
-            rm_state_onehot,                        # (num_drones, num_envs, 4)
-        ], dim=-1)  # (num_drones, num_envs, 23)
-        
-        # Convert to dictionary format (still need loop, but much faster than per-agent computation)
-        obs_dict = {}
-        for j in range(self.num_drones):
-            obs_dict[f"robot_{j}"] = all_obs[j]  # (num_envs, 23)
-        
-        return obs_dict
-
-
-    def _get_states(self) -> torch.Tensor:
-        """Get centralized state for MAPPO critic (fully vectorized).
-        
-        Returns:
-            Concatenated observations from all agents for centralized critic.
-            Shape: (num_envs, num_agents * obs_dim)
-        """
-        # ✅ REUSE observations already computed in _get_observations()
-        # Since _get_observations() is called before _get_states() in the environment step,
-        # we can reuse the vectorized computation
-        
-        # Stack all robot data: (num_drones, num_envs, 3)
-        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
-        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
-        all_gravities = torch.stack([rob.data.projected_gravity_b for rob in self._robots], dim=0)
-        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
-        all_quats = torch.stack([rob.data.root_quat_w for rob in self._robots], dim=0)
-        
-        # Transform desired positions to body frame (vectorized for all agents)
-        desired_pos_w_transposed = self._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
-        
-        desired_pos_b, _ = subtract_frame_transforms(
-            all_positions.reshape(-1, 3),
-            all_quats.reshape(-1, 4),
-            desired_pos_w_transposed.reshape(-1, 3)
-        )
-        desired_pos_b = desired_pos_b.reshape(self.num_drones, self.num_envs, 3)
-        
-        # Get obstacle distances (vectorized)
-        obstacle_dists = self._get_nearest_obstacle_distance_vectorized(all_positions)
-        
-        # Get neighbor data (vectorized)
-        neighbor_rel_pos_b, neighbor_rel_vel_b = self._get_nearest_neighbor_data_vectorized(
-            all_positions, all_quats
-        )
-        
-        # RM state one-hot encoding (vectorized)
-        rm_states_transposed = self._rm_states.transpose(0, 1)
-        rm_state_onehot = torch.nn.functional.one_hot(
-            rm_states_transposed, 
-            num_classes=self.cfg.num_rm_states
-        ).float()
-        
-        # Concatenate all observations: (num_drones, num_envs, 23)
-        all_obs = torch.cat([
-            all_lin_vels,
-            all_ang_vels,
-            all_gravities,
-            desired_pos_b,
-            obstacle_dists.unsqueeze(-1),
-            neighbor_rel_vel_b,
-            neighbor_rel_pos_b,
-            rm_state_onehot,
-        ], dim=-1)
-        
-        # ✅ VECTORIZED CONCATENATION: Reshape to (num_envs, num_agents * obs_dim)
-        # Transpose to (num_envs, num_drones, 23)
-        all_obs = all_obs.transpose(0, 1)
-        
-        # Flatten agents dimension: (num_envs, num_drones * 23)
-        state = all_obs.reshape(self.num_envs, -1)
-        
-        return state
-    
-    ##TODO : adjust rewards weights and terms based on current stage in the curriculum
     def _get_rewards_slow(self) -> dict[str, torch.Tensor]:
         """Calculate RM state-aware rewards for curriculum learning.
         
@@ -542,9 +702,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             is_hovering = (self._rm_states[:, j] == 0).float()  # (num_envs,)
             vel_scale = 1.0 + 0.5 * is_hovering  # 1.5x penalty when hovering, 1.0x otherwise
 
-            lin_vel_sum += lin_vel * vel_scale * self.cfg.lin_vel_reward_scale * self.step_dt
-            ang_vel_sum += ang_vel * vel_scale * self.cfg.ang_vel_reward_scale * self.step_dt
-            dist_goal_sum += distance_to_goal_mapped * self.cfg.distance_to_goal_reward_scale * self.step_dt
+            lin_vel_sum += lin_vel * vel_scale * self.cfg.reward_cfg.lin_vel_reward_scale * self.step_dt
+            ang_vel_sum += ang_vel * vel_scale * self.cfg.reward_cfg.ang_vel_reward_scale * self.step_dt
+            dist_goal_sum += distance_to_goal_mapped * self.cfg.reward_cfg.distance_to_goal_reward_scale * self.step_dt
 
             pos_list.append(rob.data.root_pos_w)
 
@@ -560,16 +720,16 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             dmat = torch.cdist(positions, positions)  # pairwise distances
 
             # Formation penalty: too close or too dispersed
-            too_close = torch.clamp(self.cfg.min_sep - dmat, min=0.0)
+            too_close = torch.clamp(self.cfg.swarm_cfg.min_safe_distance - dmat, min=0.0)
             mean_dist = torch.mean(dmat, dim=(1, 2))
-            formation_pen = self.cfg.formation_penalty_scale * (
+            formation_pen = self.cfg.reward_cfg.formation_penalty_scale * (
                 torch.mean(too_close, dim=(1, 2)) + 
-                torch.clamp(mean_dist - self.cfg.max_sep_mean, min=0.0)
+                torch.clamp(mean_dist - self.cfg.swarm_cfg.max_formation_distance, min=0.0)
             ) * self.step_dt
 
         # Collision penalty: any drone below minimum height (all stages)
         collided = positions[:, :, 2] < 0.1
-        collision_pen = self.cfg.collision_penalty_scale * collided.any(dim=1).float() * self.step_dt
+        collision_pen = self.cfg.reward_cfg.collision_penalty_scale * collided.any(dim=1).float() * self.step_dt
 
         # -----------------------------------------------------
         # 3. ✅ NEW: RM STATE-AWARE BONUSES
@@ -591,7 +751,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             target_altitude = self._desired_pos_w[:, j, 2]  # (num_envs,)
             altitude_error = torch.abs(agent_z - target_altitude)
             altitude_bonus_per_agent = torch.exp(-altitude_error) * is_hovering  # Exponential decay with error
-            altitude_bonus += altitude_bonus_per_agent * self.cfg.altitude_bonus_scale * self.step_dt
+            altitude_bonus += altitude_bonus_per_agent * self.cfg.reward_cfg.altitude_bonus_scale * self.step_dt
             
             # -----------------------------------------------
             # 3.2 OBSTACLE AVOIDANCE BONUS (Obstacle-avoiding state)
@@ -604,7 +764,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             safe_distance = 2.0  # meters
             obstacle_clearance_ratio = torch.clamp(nearest_obs_dist / safe_distance, 0.0, 1.0)
             obstacle_bonus_per_agent = obstacle_clearance_ratio * is_avoiding
-            obstacle_bonus += obstacle_bonus_per_agent * self.cfg.obstacle_bonus_scale * self.step_dt
+            obstacle_bonus += obstacle_bonus_per_agent * self.cfg.reward_cfg.obstacle_bonus_scale * self.step_dt
             
             # -----------------------------------------------
             # 3.3 NEIGHBOR COORDINATION BONUS (Coop-moving state)
@@ -616,17 +776,17 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 neighbor_dist = torch.linalg.norm(neighbor_rel_pos, dim=1)  # (num_envs,)
                 
                 # Optimal neighbor distance: 1.0m (half of max_neighbor_distance)
-                optimal_distance = self.cfg.max_neighbor_distance / 2.0
+                optimal_distance = self.cfg.swarm_cfg.max_neighbor_distance / 2.0
                 neighbor_error = torch.abs(neighbor_dist - optimal_distance)
                 neighbor_bonus_per_agent = torch.exp(-neighbor_error / optimal_distance) * is_cooperating
-                neighbor_bonus += neighbor_bonus_per_agent * self.cfg.neighbor_bonus_scale * self.step_dt
+                neighbor_bonus += neighbor_bonus_per_agent * self.cfg.reward_cfg.neighbor_bonus_scale * self.step_dt
             
             # -----------------------------------------------
             # 3.4 STATE TRANSITION BONUS (Curriculum progression)
             # -----------------------------------------------
             # Small bonus for entering advanced states (encourages progression)
             # Hovering: 0, Single-moving: +0.05, Coop-moving: +0.10, Obstacle-avoiding: +0.15
-            state_value = current_state.float() * self.cfg.state_progress_scale
+            state_value = current_state.float() * self.cfg.reward_cfg.state_progress_scale
             state_transition_bonus += state_value * self.step_dt
 
         # -----------------------------------------------------
@@ -669,216 +829,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Return dictionary with same reward for all agents (cooperative setting)
         return {f"robot_{i}": reward for i in range(self.num_drones)}
 
-    def _get_rewards(self) -> dict[str, torch.Tensor]:
-        """Fully vectorized reward calculation."""
-        
-        # Stack all robot data: (num_drones, num_envs, 3)
-        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
-        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
-        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
-        
-        # Base velocity penalties (vectorized)
-        lin_vel_sq = torch.sum(all_lin_vels ** 2, dim=2)  # (num_drones, num_envs)
-        ang_vel_sq = torch.sum(all_ang_vels ** 2, dim=2)  # (num_drones, num_envs)
-        
-        # State-dependent scaling (vectorized)
-        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
-        is_hovering = (self._rm_states.transpose(0, 1) == 0).float()  # (num_drones, num_envs)
-        vel_scale = 1.0 + 0.5 * is_hovering
-        
-        # Apply penalties
-        lin_vel_sum = (lin_vel_sq * vel_scale).sum(dim=0) * self.cfg.lin_vel_reward_scale * self.step_dt
-        ang_vel_sum = (ang_vel_sq * vel_scale).sum(dim=0) * self.cfg.ang_vel_reward_scale * self.step_dt
-        
-        # Distance to goal (vectorized)
-        # _desired_pos_w: (num_envs, num_drones, 3) -> transpose -> (num_drones, num_envs, 3)
-        desired_transposed = self._desired_pos_w.transpose(0, 1)
-        distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
-        distance_mapped = 1 - torch.tanh(distances / 0.8)
-        dist_goal_sum = distance_mapped.sum(dim=0) * self.cfg.distance_to_goal_reward_scale * self.step_dt
-        
-        # Formation penalties (already vectorized)
-        if self.curriculum_stage in [4, 5]:
-            # Transpose to (num_envs, num_drones, 3)
-            positions = all_positions.transpose(0, 1)
-            dmat = torch.cdist(positions, positions)
-            too_close = torch.clamp(self.cfg.min_sep - dmat, min=0.0)
-            mean_dist = torch.mean(dmat, dim=(1, 2))
-            formation_pen = self.cfg.formation_penalty_scale * (
-                torch.mean(too_close, dim=(1, 2)) + 
-                torch.clamp(mean_dist - self.cfg.max_sep_mean, min=0.0)
-            ) * self.step_dt
-        else:
-            formation_pen = torch.zeros(self.num_envs, device=self.device)
-        
-        # Collision penalty (vectorized)
-        # all_positions: (num_drones, num_envs, 3) -> z-coords: (num_drones, num_envs)
-        agent_z = all_positions[:, :, 2]
-        collided = agent_z < 0.1  # (num_drones, num_envs)
-        collision_pen = self.cfg.collision_penalty_scale * collided.any(dim=0).float() * self.step_dt
-        
-        # RM state bonuses (vectorized)
-        altitude_bonus = self._compute_altitude_bonus_vectorized(all_positions, desired_transposed)
-        obstacle_bonus = self._compute_obstacle_bonus_vectorized(all_positions)
-        neighbor_bonus = self._compute_neighbor_bonus_vectorized(all_positions)
-        state_bonus = self._compute_state_bonus_vectorized()
-        
-        # Combine
-        reward = (
-            lin_vel_sum + ang_vel_sum + dist_goal_sum +
-            formation_pen + collision_pen +
-            altitude_bonus + obstacle_bonus + neighbor_bonus + state_bonus
-        )
-        
-        # Logging (vectorized)
-        self._episode_sums["lin_vel"] += lin_vel_sum
-        self._episode_sums["ang_vel"] += ang_vel_sum
-        self._episode_sums["distance_to_goal"] += dist_goal_sum
-        self._episode_sums["formation"] += formation_pen
-        self._episode_sums["collision"] += collision_pen
-        
-        return {f"robot_{i}": reward for i in range(self.num_drones)}
-
-    # Helper functions
-    def _compute_altitude_bonus_vectorized(self, all_positions, desired_transposed):
-        """Vectorized altitude bonus computation."""
-        is_hovering = (self._rm_states.transpose(0, 1) == 0).float()  # (num_drones, num_envs)
-        target_altitude = desired_transposed[:, :, 2]  # (num_drones, num_envs)
-        altitude_error = torch.abs(all_positions[:, :, 2] - target_altitude)
-        bonus = (torch.exp(-altitude_error) * is_hovering).sum(dim=0)
-        return bonus * self.cfg.altitude_bonus_scale * self.step_dt
-
-    def _get_nearest_obstacle_distance_vectorized(self, all_positions: torch.Tensor) -> torch.Tensor:
-        """Vectorized obstacle distance calculation for all agents.
-        
-        Args:
-            all_positions: Agent positions, shape (num_drones, num_envs, 3)
-        
-        Returns:
-            Nearest obstacle distances, shape (num_drones, num_envs)
-            Clamped to [0, max_obstacle_distance]
-        """
-        if self._obstacle_positions is None or self.curriculum_stage not in [3, 5]:
-            # No obstacles active in current stage
-            return torch.full(
-                (self.num_drones, self.num_envs), 
-                self.cfg.max_obstacle_distance, 
-                device=self.device
-            )
-        
-        # Reshape for broadcasting
-        # all_positions: (num_drones, num_envs, 3)
-        # obstacle_positions: (num_obstacles, 3)
-        # Result after broadcasting: (num_drones, num_envs, num_obstacles, 3)
-        
-        # Expand dimensions for broadcasting
-        agent_pos_expanded = all_positions.unsqueeze(2)  # (num_drones, num_envs, 1, 3)
-        obs_pos_expanded = self._obstacle_positions.unsqueeze(0).unsqueeze(0)  # (1, 1, num_obstacles, 3)
-        
-        # Calculate distances: (num_drones, num_envs, num_obstacles)
-        diff = agent_pos_expanded - obs_pos_expanded
-        distances = torch.linalg.norm(diff, dim=3)  # (num_drones, num_envs, num_obstacles)
-        
-        # Find minimum distance to any obstacle: (num_drones, num_envs)
-        min_distances = distances.min(dim=2)[0]
-        
-        # Clamp to maximum range
-        min_distances = torch.clamp(min_distances, 0.0, self.cfg.max_obstacle_distance)
-        
-        return min_distances
-
-
-    def _compute_obstacle_bonus_vectorized(self, all_positions: torch.Tensor) -> torch.Tensor:
-        """Vectorized obstacle avoidance bonus computation.
-        
-        Args:
-            all_positions: Agent positions, shape (num_drones, num_envs, 3)
-        
-        Returns:
-            Obstacle bonus summed across all agents, shape (num_envs,)
-        """
-        # Get obstacle-avoiding mask: (num_drones, num_envs)
-        is_avoiding = (self._rm_states.transpose(0, 1) == 3).float()
-        
-        # Get nearest obstacle distances: (num_drones, num_envs)
-        nearest_obs_dist = self._get_nearest_obstacle_distance_vectorized(all_positions)
-        
-        # Bonus increases with distance (up to safe threshold)
-        safe_distance = 2.0  # meters
-        obstacle_clearance_ratio = torch.clamp(nearest_obs_dist / safe_distance, 0.0, 1.0)
-        
-        # Apply bonus only when in obstacle-avoiding state: (num_drones, num_envs)
-        bonus_per_agent = obstacle_clearance_ratio * is_avoiding
-        
-        # Sum across all agents: (num_envs,)
-        bonus = bonus_per_agent.sum(dim=0)
-        
-        return bonus * self.cfg.obstacle_bonus_scale * self.step_dt
-
-
-    def _compute_neighbor_bonus_vectorized(self, all_positions: torch.Tensor) -> torch.Tensor:
-        """Vectorized neighbor coordination bonus computation.
-        
-        Args:
-            all_positions: Agent positions, shape (num_drones, num_envs, 3)
-        
-        Returns:
-            Neighbor bonus summed across all agents, shape (num_envs,)
-        """
-        # Only compute for swarm stages
-        if self.curriculum_stage not in [4, 5]:
-            return torch.zeros(self.num_envs, device=self.device)
-        
-        # Get cooperating mask: (num_drones, num_envs)
-        is_cooperating = (self._rm_states.transpose(0, 1) == 2).float()
-        
-        # Compute pairwise distances: (num_drones, num_drones, num_envs)
-        diff = all_positions.unsqueeze(1) - all_positions.unsqueeze(0)  # (num_drones, num_drones, num_envs, 3)
-        distances = torch.linalg.norm(diff, dim=3)  # (num_drones, num_drones, num_envs)
-        
-        # Set self-distances to large value to ignore
-        eye_mask = torch.eye(self.num_drones, device=self.device).unsqueeze(2)  # (num_drones, num_drones, 1)
-        distances = distances + eye_mask * 1e6
-        
-        # Find nearest neighbor distance for each agent: (num_drones, num_envs)
-        neighbor_dist = distances.min(dim=1)[0]  # (num_drones, num_envs)
-        
-        # Optimal neighbor distance
-        optimal_distance = self.cfg.max_neighbor_distance / 2.0
-        
-        # Calculate bonus based on distance error
-        neighbor_error = torch.abs(neighbor_dist - optimal_distance)
-        bonus_per_agent = torch.exp(-neighbor_error / optimal_distance) * is_cooperating
-        
-        # Sum across all agents: (num_envs,)
-        bonus = bonus_per_agent.sum(dim=0)
-        
-        return bonus * self.cfg.neighbor_bonus_scale * self.step_dt
-
-
-    def _compute_state_bonus_vectorized(self) -> torch.Tensor:
-        """Vectorized state progression bonus computation.
-        
-        Returns:
-            State bonus summed across all agents, shape (num_envs,)
-        """
-        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
-        rm_states_transposed = self._rm_states.transpose(0, 1).float()
-        
-        # State value: Hovering=0, Single-moving=1, Coop-moving=2, Obstacle-avoiding=3
-        # Multiply by scale to get bonus
-        state_value_per_agent = rm_states_transposed * self.cfg.state_progress_scale
-        
-        # Sum across all agents: (num_envs,)
-        bonus = state_value_per_agent.sum(dim=0)
-        
-        return bonus * self.step_dt
-
-    ## TODO : adjust termination conditions based on current stage in the curriculum
-    #+=====================================================================
-    #============================== GET DONES helpers ===========================
-    #+=====================================================================
-    
+#----Termination Conditions with Curriculum Awareness----#  
     
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Check termination conditions with curriculum-aware logic.
@@ -908,8 +859,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             agent_z = rob.data.root_pos_w[:, 2]  # (num_envs,)
             
             # ✅ IMPROVED: Use configured height bounds
-            too_low = agent_z < self.cfg.min_flight_height  # Below ground/obstacles
-            too_high = agent_z > self.cfg.max_flight_height  # Above safe zone
+            too_low = agent_z < self.cfg.reward_cfg.min_flight_height  # Below ground/obstacles
+            too_high = agent_z > self.cfg.reward_cfg.max_flight_height  # Above safe zone
             
             # Any agent collision causes environment termination
             died_collision = died_collision | too_low | too_high
@@ -921,7 +872,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         died_out_of_bounds = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         env_origins = self._terrain.env_origins  # (num_envs, 3)
-        max_distance_from_origin = self.cfg.max_distance_from_origin  # e.g., 50.0m
+        max_distance_from_origin = self.cfg.reward_cfg.max_distance_from_origin  # e.g., 50.0m
         
         for rob in self._robots:
             # Calculate XY distance from environment origin
@@ -1028,8 +979,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             # Agent reached goal if:
             # 1. Position within threshold (0.15m)
             # 2. Velocity below threshold (0.2 m/s)
-            agent_reached = (distance_to_goal < self.cfg.hover_position_threshold) & \
-                        (velocity_mag < self.cfg.hover_velocity_threshold)
+            agent_reached = (distance_to_goal < self.cfg.reward_cfg.hover_position_threshold) & \
+                        (velocity_mag < self.cfg.reward_cfg.hover_velocity_threshold)
             
             # ALL agents must reach goals
             goal_reached_per_env = goal_reached_per_env & agent_reached
@@ -1052,7 +1003,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             )  # (num_envs,)
             
             # Agent reached goal if within threshold (0.3m for moving goals)
-            agent_reached = distance_to_goal < self.cfg.goal_position_threshold
+            agent_reached = distance_to_goal < self.cfg.reward_cfg.goal_position_threshold
             
             # ALL agents must reach goals
             goal_reached_per_env = goal_reached_per_env & agent_reached
@@ -1096,7 +1047,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         centroid_distance = torch.linalg.norm(swarm_centroid - goal_centroid, dim=1)  # (num_envs,)
         
         # Swarm reached goal if centroid within threshold
-        goal_reached = centroid_distance < self.cfg.swarm_goal_threshold  # e.g., 0.5m
+        goal_reached = centroid_distance < self.cfg.reward_cfg.swarm_goal_threshold  # e.g., 0.5m
         
         return goal_reached
 
@@ -1240,91 +1191,11 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 for viz in self.stage5_waypoint_visualizers:
                     viz.set_visibility(False)
     
-    def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset environments with curriculum-dependent goals & scene adjustments."""
-        if env_ids is None or len(env_ids) == self.num_envs:
-            env_ids = self._robots[0]._ALL_INDICES
-
-        # -----------------------------------------------------
-        # 1. LOG EPISODIC METRICS (same from your code)
-        # -----------------------------------------------------
-        final_distances = []
-        for j in range(self.num_drones):
-            dist = torch.linalg.norm(
-                self._desired_pos_w[env_ids, j, :]
-                - self._robots[j].data.root_pos_w[env_ids],
-                dim=1,
-            )
-            final_distances.append(dist)
-        final_distance_to_goal = torch.stack(final_distances).mean()
-
-        # reward breakdown logs
-        log_dict = {}
-        for key in self._episode_sums.keys():
-            episodic_sum_avg = torch.mean(self._episode_sums[key][env_ids])
-            log_dict[f"Episode_Reward/{key}"] = episodic_sum_avg / self.max_episode_length_s
-            self._episode_sums[key][env_ids] = 0.0
-
-        # termination logs
-        log_dict["Episode_Termination/died"] = torch.count_nonzero(
-            self._last_terminated[env_ids]
-        ).item()
-        log_dict["Episode_Termination/time_out"] = torch.count_nonzero(
-            self._last_timed_out[env_ids]
-        ).item()
-        log_dict["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
-
-        self.extras["log"] = log_dict
-
-        # reset termination state
-        self._last_terminated[env_ids] = False
-        self._last_timed_out[env_ids] = False
-
-        # -----------------------------------------------------
-        # 2. RESET ROBOTS TO DEFAULT STATE
-        # -----------------------------------------------------
-        for rob in self._robots:
-            rob.reset(env_ids)
-
-        super()._reset_idx(env_ids)
-
-        # desync episode starts
-        if len(env_ids) == self.num_envs:
-            self.episode_length_buf = torch.randint_like(
-                self.episode_length_buf, high=int(self.max_episode_length)
-            )
-
-        self._actions[env_ids] = 0.0
-        # ✅ NEW: Reset RM states to Hovering (0) for all agents
-        self._rm_states[env_ids, :] = 0
-        # -----------------------------------------------------
-        # 3. GET ENV ORIGINS
-        # -----------------------------------------------------
-        env_origins = self._terrain.env_origins[env_ids]
-
-        # -----------------------------------------------------
-        # 4. CURRICULUM LOGIC — SELECT THE RIGHT STAGE BEHAVIOR
-        # -----------------------------------------------------
-        stage = self.curriculum_stage
-        #print(f"Global step: {self.global_step}, Curriculum stage: {stage}")
-        if stage == 1:
-            # Individual Hover
-            self._set_stage1_positions(env_ids, env_origins)
-        elif stage == 2:
-            # Individual XY movement
-            self._set_stage2_positions(env_ids, env_origins)
-        elif stage == 3:
-            # Individual Point-to-Point with Obstacles
-            self._set_stage3_positions(env_ids, env_origins)        
-        elif stage == 4:
-            # Swarm navigation (no obstacles)            
-            self._set_stage4_positions(env_ids, env_origins)
-        else:  # stage == 5
-            self._set_stage5_positions(env_ids, env_origins)
+    
             
-###--- Reward Machine helpers
+###--- Reward Machine helper methods ---###
     def _switch_rm_state(self):
-        """Update Reward Machine states for all agents based on current conditions.
+        """Update Reward Machine states for all agents based on current conditions (VECTORIZED).
         
         State transitions:
         - Hovering (0): agent_z <= hover_min_altitude
@@ -1334,52 +1205,201 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         Updates self._rm_states: (num_envs, num_drones) tensor with state indices
         """
-        for j, rob in enumerate(self._robots):
-            # Get agent's current altitude
-            agent_z = rob.data.root_pos_w[:, 2]  # (num_envs,)
+        # ✅ VECTORIZED: Stack all robot positions at once
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)  # (num_drones, num_envs, 3)
+        
+        # Extract altitudes: (num_drones, num_envs)
+        all_z = all_positions[:, :, 2]
+        
+        # Get obstacle distances (vectorized for all agents): (num_drones, num_envs)
+        nearest_obstacle_dists = self._get_nearest_obstacle_distance_vectorized(all_positions)
+        
+        # Get neighbor distances (vectorized for all agents)
+        # We need only distances, not full relative positions
+        if self.curriculum_stage in [1, 2, 3]:
+            # Default: all agents far from neighbors
+            neighbor_dists = torch.full(
+                (self.num_drones, self.num_envs), 
+                self.cfg.swarm_cfg.max_neighbor_distance, 
+                device=self.device
+            )
+        else:
+            # Stages 4-5: Compute actual pairwise distances
+            # all_positions: (num_drones, num_envs, 3)
+            diff = all_positions.unsqueeze(1) - all_positions.unsqueeze(0)  # (num_drones, num_drones, num_envs, 3)
+            distances = torch.linalg.norm(diff, dim=3)  # (num_drones, num_drones, num_envs)
             
-            # Get distance to nearest obstacle
-            nearest_obstacle_dist = self._get_nearest_obstacle_distance(rob.data.root_pos_w)  # (num_envs,)
+            # Set self-distances to large value
+            eye_mask = torch.eye(self.num_drones, device=self.device).unsqueeze(2)  # (num_drones, num_drones, 1)
+            distances = distances + eye_mask * 1e6
             
-            # Get distance to nearest neighbor
-            neighbor_rel_pos_w, _ = self._get_nearest_neighbor_data(j)  # (num_envs, 3)
-            neighbor_dist = torch.linalg.norm(neighbor_rel_pos_w, dim=1)  # (num_envs,)
+            # Find nearest neighbor distance for each agent: (num_drones, num_envs)
+            neighbor_dists = distances.min(dim=1)[0]
+        
+        # ✅ VECTORIZED STATE TRANSITION LOGIC
+        # All operations on (num_drones, num_envs) tensors
+        
+        # Initialize all states as Hovering (0)
+        new_states = torch.zeros_like(all_z, dtype=torch.long)  # (num_drones, num_envs)
+        
+        # Check conditions
+        above_hover = all_z > self.cfg.reward_cfg.hover_min_altitude
+        far_from_obstacle = nearest_obstacle_dists > self.cfg.reward_cfg.close_obs_dist_thresh
+        near_neighbor = neighbor_dists < self.cfg.swarm_cfg.max_neighbor_distance
+        
+        # Apply state transitions (order matters - later assignments override earlier ones)
+        # State 1 (S): Above hover AND far from obstacle AND far from neighbor
+        single_moving_mask = above_hover & far_from_obstacle & (~near_neighbor)
+        new_states[single_moving_mask] = 1
+        
+        # State 2 (C): Above hover AND far from obstacle AND near neighbor
+        coop_moving_mask = above_hover & far_from_obstacle & near_neighbor
+        new_states[coop_moving_mask] = 2
+        
+        # State 3 (O): Above hover AND close to obstacle (overrides states 1 & 2)
+        obstacle_avoiding_mask = above_hover & (~far_from_obstacle)
+        new_states[obstacle_avoiding_mask] = 3
+        
+        # State 0 (H): Below hover threshold (overrides all - highest priority)
+        hovering_mask = ~above_hover
+        new_states[hovering_mask] = 0
+        
+        # ✅ Update state buffer: (num_drones, num_envs) -> transpose -> (num_envs, num_drones)
+        self._rm_states = new_states.transpose(0, 1)
             
-            # State transition logic (vectorized for all environments)
-            # Start with all states as Hovering (0)
-            new_states = torch.zeros_like(agent_z, dtype=torch.long)
-            
-            # Check if agent is above hover threshold
-            above_hover = agent_z > self.cfg.hover_min_altitude
-            
-            # Check obstacle distance
-            far_from_obstacle = nearest_obstacle_dist > self.cfg.close_obs_dist_thresh
-            
-            # Check neighbor distance
-            near_neighbor = neighbor_dist < self.cfg.max_neighbor_distance
-            
-            # Apply state transition logic
-            # State 3 (O): Above hover AND close to obstacle
-            obstacle_avoiding_mask = above_hover & (~far_from_obstacle)
-            new_states[obstacle_avoiding_mask] = 3
-            
-            # State 2 (C): Above hover AND far from obstacle AND near neighbor
-            coop_moving_mask = above_hover & far_from_obstacle & near_neighbor
-            new_states[coop_moving_mask] = 2
-            
-            # State 1 (S): Above hover AND far from obstacle AND far from neighbor
-            single_moving_mask = above_hover & far_from_obstacle & (~near_neighbor)
-            new_states[single_moving_mask] = 1
-            
-            # State 0 (H): Below hover threshold (default, already set)
-            # This overrides all other states if altitude is too low
-            hovering_mask = ~above_hover
-            new_states[hovering_mask] = 0
-            
-            # Update state buffer
-            self._rm_states[:, j] = new_states
-            
-###----- Distance based helpers
+    def _compute_altitude_bonus_vectorized(self, all_positions, desired_transposed):
+        """Vectorized altitude bonus computation."""
+        is_hovering = (self._rm_states.transpose(0, 1) == 0).float()  # (num_drones, num_envs)
+        target_altitude = desired_transposed[:, :, 2]  # (num_drones, num_envs)
+        altitude_error = torch.abs(all_positions[:, :, 2] - target_altitude)
+        bonus = (torch.exp(-altitude_error) * is_hovering).sum(dim=0)
+        return bonus * self.cfg.reward_cfg.altitude_bonus_scale * self.step_dt
+
+    def _get_nearest_obstacle_distance_vectorized(self, all_positions: torch.Tensor) -> torch.Tensor:
+        """Vectorized obstacle distance calculation for all agents.
+        
+        Args:
+            all_positions: Agent positions, shape (num_drones, num_envs, 3)
+        
+        Returns:
+            Nearest obstacle distances, shape (num_drones, num_envs)
+            Clamped to [0, max_obstacle_distance]
+        """
+        if self._obstacle_positions is None or self.curriculum_stage not in [3, 5]:
+            # No obstacles active in current stage
+            return torch.full(
+                (self.num_drones, self.num_envs), 
+                self.cfg.curriculum.max_obstacle_distance, 
+                device=self.device
+            )
+        
+        # Reshape for broadcasting
+        # all_positions: (num_drones, num_envs, 3)
+        # obstacle_positions: (num_obstacles, 3)
+        # Result after broadcasting: (num_drones, num_envs, num_obstacles, 3)
+        
+        # Expand dimensions for broadcasting
+        agent_pos_expanded = all_positions.unsqueeze(2)  # (num_drones, num_envs, 1, 3)
+        obs_pos_expanded = self._obstacle_positions.unsqueeze(0).unsqueeze(0)  # (1, 1, num_obstacles, 3)
+        
+        # Calculate distances: (num_drones, num_envs, num_obstacles)
+        diff = agent_pos_expanded - obs_pos_expanded
+        distances = torch.linalg.norm(diff, dim=3)  # (num_drones, num_envs, num_obstacles)
+        
+        # Find minimum distance to any obstacle: (num_drones, num_envs)
+        min_distances = distances.min(dim=2)[0]
+        
+        # Clamp to maximum range
+        min_distances = torch.clamp(min_distances, 0.0, self.cfg.curriculum.max_obstacle_distance)
+        
+        return min_distances
+
+    def _compute_obstacle_bonus_vectorized(self, all_positions: torch.Tensor) -> torch.Tensor:
+        """Vectorized obstacle avoidance bonus computation.
+        
+        Args:
+            all_positions: Agent positions, shape (num_drones, num_envs, 3)
+        
+        Returns:
+            Obstacle bonus summed across all agents, shape (num_envs,)
+        """
+        # Get obstacle-avoiding mask: (num_drones, num_envs)
+        is_avoiding = (self._rm_states.transpose(0, 1) == 3).float()
+        
+        # Get nearest obstacle distances: (num_drones, num_envs)
+        nearest_obs_dist = self._get_nearest_obstacle_distance_vectorized(all_positions)
+        
+        # Bonus increases with distance (up to safe threshold)
+        safe_distance = 2.0  # meters
+        obstacle_clearance_ratio = torch.clamp(nearest_obs_dist / safe_distance, 0.0, 1.0)
+        
+        # Apply bonus only when in obstacle-avoiding state: (num_drones, num_envs)
+        bonus_per_agent = obstacle_clearance_ratio * is_avoiding
+        
+        # Sum across all agents: (num_envs,)
+        bonus = bonus_per_agent.sum(dim=0)
+        
+        return bonus * self.cfg.reward_cfg.obstacle_bonus_scale * self.step_dt
+
+    def _compute_neighbor_bonus_vectorized(self, all_positions: torch.Tensor) -> torch.Tensor:
+        """Vectorized neighbor coordination bonus computation.
+        
+        Args:
+            all_positions: Agent positions, shape (num_drones, num_envs, 3)
+        
+        Returns:
+            Neighbor bonus summed across all agents, shape (num_envs,)
+        """
+        # Only compute for swarm stages
+        if self.curriculum_stage not in [4, 5]:
+            return torch.zeros(self.num_envs, device=self.device)
+        
+        # Get cooperating mask: (num_drones, num_envs)
+        is_cooperating = (self._rm_states.transpose(0, 1) == 2).float()
+        
+        # Compute pairwise distances: (num_drones, num_drones, num_envs)
+        diff = all_positions.unsqueeze(1) - all_positions.unsqueeze(0)  # (num_drones, num_drones, num_envs, 3)
+        distances = torch.linalg.norm(diff, dim=3)  # (num_drones, num_drones, num_envs)
+        
+        # Set self-distances to large value to ignore
+        eye_mask = torch.eye(self.num_drones, device=self.device).unsqueeze(2)  # (num_drones, num_drones, 1)
+        distances = distances + eye_mask * 1e6
+        
+        # Find nearest neighbor distance for each agent: (num_drones, num_envs)
+        neighbor_dist = distances.min(dim=1)[0]  # (num_drones, num_envs)
+        
+        # Optimal neighbor distance
+        optimal_distance = self.cfg.reward_cfg.optimal_neighbor_distance
+        
+        # Calculate bonus based on distance error
+        neighbor_error = torch.abs(neighbor_dist - optimal_distance)
+        bonus_per_agent = torch.exp(-neighbor_error / optimal_distance) * is_cooperating
+        
+        # Sum across all agents: (num_envs,)
+        bonus = bonus_per_agent.sum(dim=0)
+        
+        return bonus * self.cfg.reward_cfg.neighbor_bonus_scale * self.step_dt
+
+    def _compute_state_bonus_vectorized(self) -> torch.Tensor:
+        """Vectorized state progression bonus computation.
+        
+        Returns:
+            State bonus summed across all agents, shape (num_envs,)
+        """
+        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
+        rm_states_transposed = self._rm_states.transpose(0, 1).float()
+        
+        # State value: Hovering=0, Single-moving=1, Coop-moving=2, Obstacle-avoiding=3
+        # Multiply by scale to get bonus
+        state_value_per_agent = rm_states_transposed * self.cfg.reward_cfg.state_progress_scale
+        
+        # Sum across all agents: (num_envs,)
+        bonus = state_value_per_agent.sum(dim=0)
+        
+        return bonus * self.step_dt
+
+
+###------ Distance based helpers ------###
     def _get_nearest_obstacle_distance(self, agent_position: torch.Tensor) -> torch.Tensor:
         """Calculate distance from agent to nearest obstacle.
         
@@ -1392,7 +1412,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         """
         if self._obstacle_positions is None or self.curriculum_stage not in [3, 5]:
             # No obstacles active in current stage
-            return torch.full((self.num_envs,), self.cfg.max_obstacle_distance, device=self.device)
+            return torch.full((self.num_envs,), self.cfg.curriculum.max_obstacle_distance, device=self.device)
         
         # Calculate distances to all obstacles
         # agent_position: (num_envs, 3)
@@ -1404,7 +1424,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         min_distances, _ = distances.min(dim=-1)  # (num_envs,)
         
         # Clamp to maximum range
-        min_distances = torch.clamp(min_distances, 0.0, self.cfg.max_obstacle_distance)
+        min_distances = torch.clamp(min_distances, 0.0, self.cfg.curriculum.max_obstacle_distance)
         
         return min_distances
 
@@ -1431,7 +1451,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             # Position: far away in X direction (max_neighbor_distance, 0, 0)
             # Velocity: zero relative motion
             default_rel_pos = torch.zeros(self.num_envs, 3, device=self.device)
-            default_rel_pos[:, 0] = self.cfg.max_neighbor_distance  # Far away in X
+            default_rel_pos[:, 0] = self.cfg.swarm_cfg.max_neighbor_distance  # Far away in X
             
             default_rel_vel = torch.zeros(self.num_envs, 3, device=self.device)
             
@@ -1496,8 +1516,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # This prevents extremely large values if agents are far apart
         rel_pos_norm = torch.linalg.norm(relative_position, dim=1, keepdim=True)
         relative_position = torch.where(
-            rel_pos_norm > self.cfg.max_neighbor_distance,
-            relative_position * (self.cfg.max_neighbor_distance / (rel_pos_norm + 1e-8)),
+            rel_pos_norm > self.cfg.swarm_cfg.max_neighbor_distance,
+            relative_position * (self.cfg.swarm_cfg.max_neighbor_distance / (rel_pos_norm + 1e-8)),
             relative_position
         )
         
@@ -1517,7 +1537,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         if self.curriculum_stage in [1, 2, 3]:
             # Return defaults
             default_rel_pos = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
-            default_rel_pos[:, :, 0] = self.cfg.max_neighbor_distance
+            default_rel_pos[:, :, 0] = self.cfg.swarm_cfg.max_neighbor_distance
             default_rel_vel = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
             return default_rel_pos, default_rel_vel
         
@@ -1553,8 +1573,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Clamp magnitude
         rel_pos_norm = torch.linalg.norm(relative_pos_w, dim=2, keepdim=True)  # (num_drones, num_envs, 1)
         relative_pos_w = torch.where(
-            rel_pos_norm > self.cfg.max_neighbor_distance,
-            relative_pos_w * (self.cfg.max_neighbor_distance / (rel_pos_norm + 1e-8)),
+            rel_pos_norm > self.cfg.swarm_cfg.max_neighbor_distance,
+            relative_pos_w * (self.cfg.swarm_cfg.max_neighbor_distance / (rel_pos_norm + 1e-8)),
             relative_pos_w
         )
         
@@ -1581,46 +1601,10 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return relative_pos_b, relative_vel_b
 
-#### Curriculum methods for adjusting agents targets positions and environment obstacles based on curriculum stage
-    def update_curriculum_stage(self):
-        step = self.global_step
-        c = self.cfg.curriculum
-        
-        if step <= c.stage1_end:
-            if self.curriculum_stage != 1:
-                print("Changed to curriculum stage 1: Individual Hover")
-            self.curriculum_stage = 1
-            self.cfg.episode_length_s = c.stage1_episode_length_s
-            
-        elif step <= c.stage2_end:
-            if self.curriculum_stage != 2:
-                print("Changed to curriculum stage 2: Individual Point-to-Point")
-            self.curriculum_stage = 2
-            self.cfg.episode_length_s = c.stage2_episode_length_s
-            
-        elif step <= c.stage3_end:
-            if self.curriculum_stage != 3:
-                print("Changed to curriculum stage 3: Individual Point-to-Point with Obstacles")
-            self.curriculum_stage = 3
-            self.cfg.episode_length_s = c.stage3_episode_length_s
-            
-        elif step <= c.stage4_end:
-            if self.curriculum_stage != 4:
-                print("Changed to curriculum stage 4: Swarm Navigation without Obstacles")
-            self.curriculum_stage = 4
-            self.cfg.episode_length_s = c.stage4_episode_length_s
-        
-        elif step <= c.stage5_end:
-            if self.curriculum_stage != 5:
-                    print("Changed to curriculum stage 5: Swarm Navigation with Obstacles")
-            self.curriculum_stage = 5
-            self.cfg.episode_length_s = c.stage5_episode_length_s  
-        else:
-            #print("Resetting curriculum to stage 1 after completion of all stages.")
-            self.curriculum_stage = 1
-            self.global_step = 0
-            self.cfg.episode_length_s = c.stage1_episode_length_s
 
+
+###---------- Curriculum Methods ----------###
+    
     def _update_waypoint_goals_slow(self):
         """Update goal positions based on waypoint progress for stage 3.
         When an agent reaches its current waypoint (within threshold distance),
@@ -1762,7 +1746,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         obstacle_positions = []
         
         # Stage 3 obstacles: num_drones * 3
-        stage3_offset = (self.cfg.curriculum.stage3_offset_x, self.cfg.curriculum.stage3_offset_y, 0.0)
+        stage3_offset = (0,0, 0.0)
         obstacle_size = (0.2, 0.8, 5.0)
         base_height = 2.5
         lane_width = 1.5
@@ -1787,7 +1771,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 obstacle_positions.append([obs_x, obs_y, obs_z])
         
         # Stage 5 obstacles: 8 walls
-        stage5_offset = (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y, 0.0)
+        stage5_offset = (0, 0, 0.0)
         x_offset = self.cfg.curriculum.stage5_obsx_offset
         y_offset = self.cfg.curriculum.stage5_obsy_offset
         base_height = 2.5
@@ -1830,7 +1814,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         )
         from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
         
-        stage3_offset = (self.cfg.curriculum.stage3_offset_x, self.cfg.curriculum.stage3_offset_y, 0.0)
+        stage3_offset = (0, 0, 0.0)
         source_env_idx = 0
         
         # Obstacle course parameters
@@ -1910,7 +1894,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         )
         from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
         
-        stage5_offset = (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y, 0.0)
+        stage5_offset = (0, 0, 0.0)
         source_env_idx = 0
         
         # Get offset configuration
@@ -1974,21 +1958,186 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         #print(f"  - X offset: {x_offset}m, Y offset: {y_offset}m")
         #print(f"  - Base position: ({base_x}, {base_y})")
     
+
+    def _collect_obstacle_positions_stage3(self):
+        """Collect Stage 3 obstacle positions using shared parameters."""
+        obstacle_positions = []
+        
+        # ✅ GET SHARED PARAMETERS from config
+        params = self.cfg.curriculum.get_stage3_params()
+        obstacle_size = self.cfg.curriculum.obstacles_size
+        base_height = obstacle_size[2] / 2.0
+        
+        for agent_idx in range(self.num_drones):
+            lane_center_y = (agent_idx - (self.num_drones - 1) / 2.0) * params["lane_width"]
+            
+            for obs_idx in range(3):
+                obs_x = params["course_start_x"] + obs_idx * params["obstacle_spacing_x"]
+                
+                if obs_idx == 0:
+                    obs_y = lane_center_y
+                elif obs_idx == 1:
+                    obs_y = lane_center_y - params["lateral_offset"]
+                else:
+                    obs_y = lane_center_y + params["lateral_offset"]
+                
+                obs_z = base_height
+                obstacle_positions.append([obs_x, obs_y, obs_z])
+        
+        self._obstacle_positions = torch.tensor(
+            obstacle_positions, 
+            dtype=torch.float32, 
+            device=self.device
+        )
+        
+        print(f"[INFO] Collected {len(obstacle_positions)} Stage 3 obstacle positions")
+
+    def _collect_obstacle_positions_stage5(self):
+        """Collect Stage 5 obstacle positions matching REDUCED parameters."""
+        obstacle_positions = []
+        
+        # ✅ MATCH _build_stage5_obstacles_at_origin() parameters
+        x_offset = self.cfg.curriculum.stage5_obsx_offset  # 1.5m
+        y_offset = self.cfg.curriculum.stage5_obsy_offset  # 2.0m
+        base_height = 4.0  # ✅ REDUCED from 2.5
+        dist_from_spawn_swarm = self.cfg.curriculum.dist_from_spawn_swarm
+        base_y = dist_from_spawn_swarm  # ✅ No Y offset
+        base_x = 0.0  # ✅ At origin
+        
+        wall_positions = [
+            (base_x - x_offset, base_y, base_height),
+            (base_x + x_offset, base_y, base_height),
+            (base_x, base_y + 0.5 * y_offset, base_height),
+            (base_x - x_offset, base_y + y_offset, base_height),
+            (base_x + x_offset, base_y + y_offset, base_height),
+            (base_x, base_y + 1.5 * y_offset, base_height),
+            (base_x - x_offset, base_y + 2 * y_offset, base_height),
+            (base_x + x_offset, base_y + 2 * y_offset, base_height),
+        ]
+        
+        obstacle_positions.extend(wall_positions)
+        
+        # Convert to tensor and store
+        self._obstacle_positions = torch.tensor(
+            obstacle_positions, 
+            dtype=torch.float32, 
+            device=self.device
+        )
+        
+        #print(f"[INFO] Collected {len(obstacle_positions)} Stage 5 obstacle positions")
+
+    # ✅ NEW: Obstacle builders at ORIGIN (no offsets)
+    def _build_stage3_obstacles_at_origin(self):
+        """Build stage 3 obstacles at environment origin (0, 0)."""
+        from isaaclab.sim.spawners.shapes import CuboidCfg
+        from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg, CollisionPropertiesCfg
+        from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
+        
+        source_env_idx = 0
+        
+        # ✅ GET SHARED PARAMETERS from config
+        params = self.cfg.curriculum.get_stage3_params()
+        obstacle_size = self.cfg.curriculum.obstacles_size
+        base_height = obstacle_size[2] / 2.0  # Half of obstacle height
+        
+        global_wall_idx = 0
+        
+        for agent_idx in range(self.num_drones):
+            lane_center_y = (agent_idx - (self.num_drones - 1) / 2.0) * params["lane_width"]
+            
+            for obs_idx in range(3):
+                obs_x = params["course_start_x"] + obs_idx * params["obstacle_spacing_x"]
+                
+                # Zig-zag pattern
+                if obs_idx == 0:
+                    obs_y = lane_center_y
+                elif obs_idx == 1:
+                    obs_y = lane_center_y - params["lateral_offset"]
+                else:
+                    obs_y = lane_center_y + params["lateral_offset"]
+                
+                obs_z = base_height
+                
+                wall_path = f"/World/envs/env_{source_env_idx}/obstacles/wall_{global_wall_idx}"
+                wall_cfg = CuboidCfg(
+                    size=obstacle_size,
+                    rigid_props=RigidBodyPropertiesCfg(
+                        rigid_body_enabled=True,
+                        kinematic_enabled=True,
+                        disable_gravity=True,
+                    ),
+                    collision_props=CollisionPropertiesCfg(collision_enabled=True),
+                    visual_material=PreviewSurfaceCfg(
+                        diffuse_color=(0.9, 0.1, 0.1),
+                        roughness=0.4,
+                        metallic=0.0,
+                    ),
+                )
+                wall_cfg.func(wall_path, wall_cfg, translation=(obs_x, obs_y, obs_z))
+                global_wall_idx += 1
+        
+        # Collect obstacle positions
+        self._collect_obstacle_positions_stage3()
+        
+        #print(f"[INFO] Built {global_wall_idx} Stage 3 obstacles using shared parameters")
     
-    def _compute_swarm_centroid(self):
-        """Compute swarm centroid position for each environment (Stages 4 & 5).
+    
+    def _build_stage5_obstacles_at_origin(self):
+        """Build stage 5 obstacles at environment origin (0, 0)."""
+        from isaaclab.sim.spawners.shapes import CuboidCfg
+        from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg, CollisionPropertiesCfg
+        from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
         
-        Calculates the mean position of all drones in each environment.
-        Updates the _swarm_centroid buffer: (num_envs, 3)
-        """
-        # Stack all drone positions: (num_envs, num_drones, 3)
-        swarm_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=1)
+        source_env_idx = 0
         
-        # Compute centroid as mean across all drones: (num_envs, 3)
-        self._swarm_centroid = swarm_positions.mean(dim=1)
+        # ✅ REDUCED: Obstacle parameters
+        x_offset = self.cfg.curriculum.stage5_obsx_offset  # 1.5m
+        y_offset = self.cfg.curriculum.stage5_obsy_offset  # 2.0m
+        obstacle_size = self.cfg.curriculum.obstacles_size  # ✅ Reduced from (1.2, 0.2, 15)
+        #Inverted dimensions for vertical walls related to Y-axis travel
+        obstacle_size = (obstacle_size[1], obstacle_size[0], obstacle_size[2])  # Reduced height
+        base_height = obstacle_size[2] / 2.0  # Half of obstacle height
+        
+        dist_from_spawn_swarm = self.cfg.curriculum.dist_from_spawn_swarm  # 2.0m
+        base_y = dist_from_spawn_swarm  # ✅ No Y offset
+        base_x = 0.0  # ✅ At origin
+        
+        wall_positions = [
+            (base_x - x_offset, base_y, base_height),
+            (base_x + x_offset, base_y, base_height),
+            (base_x, base_y + 0.5 * y_offset, base_height),
+            (base_x - x_offset, base_y + y_offset, base_height),
+            (base_x + x_offset, base_y + y_offset, base_height),
+            (base_x, base_y + 1.5 * y_offset, base_height),
+            (base_x - x_offset, base_y + 2 * y_offset, base_height),
+            (base_x + x_offset, base_y + 2 * y_offset, base_height),
+        ]
+        
+        stage5_start_idx = self.num_drones * 3
+        
+        for local_idx, (wall_x, wall_y, wall_z) in enumerate(wall_positions):
+            global_wall_idx = stage5_start_idx + local_idx
+            
+            wall_path = f"/World/envs/env_{source_env_idx}/obstacles/wall_{global_wall_idx}"
+            wall_cfg = CuboidCfg(
+                size=obstacle_size,
+                rigid_props=RigidBodyPropertiesCfg(
+                    rigid_body_enabled=True,
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                collision_props=CollisionPropertiesCfg(collision_enabled=True),
+                visual_material=PreviewSurfaceCfg(
+                    diffuse_color=(0.1, 0.1, 0.9),
+                    roughness=0.4,
+                    metallic=0.0,
+                ),
+            )
+            wall_cfg.func(wall_path, wall_cfg, translation=(wall_x, wall_y, wall_z))
+        
+        # Collect obstacle positions
+        self._collect_obstacle_positions_stage5()
 
-
-    ###---- Stage 1: Individual Hover ----###
     def _set_stage1_positions(self, env_ids, env_origins):
         """Set hover goals - simplified grid version."""
         ##This function places the drones in a grid formation at the start of the episode and assigns each drone a goal position directly above its start position at a certain height.
@@ -1996,7 +2145,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         # Create grid of start positions
         grid_size = int(torch.ceil(torch.sqrt(torch.tensor(self.num_drones, dtype=torch.float32))))
-        spacing = torch.zeros(1,device=self.device).uniform_(self.cfg.curriculum.spawn_grid_spacing_range[0], self.cfg.curriculum.spawn_grid_spacing_range[1])#max(0.5, self.cfg.min_sep)
+        spacing = torch.zeros(1,device=self.device).uniform_(self.cfg.curriculum.spawn_grid_spacing_range[0], self.cfg.curriculum.spawn_grid_spacing_range[1])#max(0.5, self.cfg.min_safe_distance)
         
         for env_idx in range(num_reset_envs):
             # Random permutation for this environment
@@ -2026,6 +2175,18 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 default_root_state[:, 1] = env_origins[env_idx, 1] + grid_y
                 default_root_state[:, 2] = start_heights[j]
                 
+                    # Start position
+                start_x = env_origins[env_idx, 0] + grid_x
+                start_y = env_origins[env_idx, 1] + grid_y
+                start_z = start_heights[j]
+
+                # ✅ DEBUG: Print drone positions
+                if env_idx == 0:  # Only print for first environment
+                    print(f"  - Drone {j}: pos=({start_x.item():.2f}, {start_y.item():.2f}, {start_z.item():.2f}), "
+                        f"goal=({start_x.item():.2f}, {start_y.item():.2f}, {goal_heights[j].item():.2f})")
+                
+
+
                 rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
                 rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
                 rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
@@ -2035,10 +2196,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 0] = default_root_state[0, 0] + xy_noise[0]
                 self._desired_pos_w[env_id_single, j, 1] = default_root_state[0, 1] + xy_noise[1]
                 self._desired_pos_w[env_id_single, j, 2] = goal_heights[j]
-
-    ##TODO improve stage 2 and 3 height goal position for higher altitude flights
-
-    ###---- Stage 2: Individual Point-to-Point ----###
+    
     def _set_stage2_positions(self, env_ids, env_origins):
         """Set individual point-to-point goals for curriculum stage 2.
         
@@ -2148,58 +2306,39 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 0] = goal_x
                 self._desired_pos_w[env_id_single, j, 1] = goal_y
                 self._desired_pos_w[env_id_single, j, 2] = goal_z
-
-    ###---- Stage 3: Individual Point-to-Point with Obstacles ----###
+ 
     def _set_stage3_positions(self, env_ids, env_origins):
-        """Set individual obstacle course navigation with waypoint-based goals.
-        
-        Each agent navigates through a zig-zag obstacle course:
-        - Waypoint 1: Behind first obstacle (center)
-        - Waypoint 2: Behind second obstacle (left)
-        - Waypoint 3: Behind third obstacle (right)
-        
-        Args:
-            env_ids: Indices of environments to reset
-            env_origins: Origins of environments, shape (num_reset_envs, 3)
-        """
+        """Set individual obstacle course navigation with waypoint-based goals."""
         num_reset_envs = len(env_ids)
-        offset_x, offset_y = self._get_stage_offset()  # Returns (10.0, 0.0) for stage 3
+        offset_x, offset_y = (0, 0)
         
-        # Obstacle course parameters (must match _build_stage3_obstacles)
-        lane_width = 1.5
-        obstacle_spacing_x = 3.0
-        lateral_offset = 0.4
-        course_start_x = offset_x + 3.0
-        waypoint_distance_behind_obstacle = 1.0  # Distance behind each obstacle
+        # ✅ GET SHARED PARAMETERS from config
+        params = self.cfg.curriculum.get_stage3_params()
         
-        # ✅ Use configured height range
+        # Height range
         min_height = self.cfg.curriculum.goal_height_range[0]
         max_height = self.cfg.curriculum.goal_height_range[1]
         
         # Agent spawn parameters
-        spawn_x = offset_x
+        spawn_x = offset_x - 0.6  # ✅ Start 0.5m BEFORE first obstacle
         
         for env_idx in range(num_reset_envs):
             env_id_int = env_ids[env_idx].item()
             env_id_single = env_ids[env_idx].unsqueeze(0)
             
-            # Random permutation for lane assignment
             perm = torch.randperm(self.num_drones, device=self.device)
-            
-            # ✅ Sample a consistent base height for this environment from configured range
-            # All waypoints will use this base height ± small variation
             base_height = torch.zeros(1, device=self.device).uniform_(min_height, max_height).item()
             
             for j, rob in enumerate(self._robots):
                 # -----------------------------------------------------
-                # AGENT START POSITION: At course entrance
+                # AGENT START POSITION
                 # -----------------------------------------------------
                 agent_lane = perm[j].item()
-                lane_center_y = offset_y + (agent_lane - (self.num_drones - 1) / 2.0) * lane_width
+                lane_center_y = offset_y + (agent_lane - (self.num_drones - 1) / 2.0) * params["lane_width"]
                 
                 start_x = env_origins[env_idx, 0] + spawn_x
                 start_y = env_origins[env_idx, 1] + lane_center_y
-                start_z = base_height  # ✅ Use sampled base height
+                start_z = base_height
                 
                 # Reset robot
                 joint_pos = rob.data.default_joint_pos[env_id_single]
@@ -2215,46 +2354,44 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
                 
                 # -----------------------------------------------------
-                # GENERATE WAYPOINT PATH (3 waypoints)
+                # GENERATE WAYPOINT PATH
                 # -----------------------------------------------------
                 for wp_idx in range(3):
-                    # Obstacle position
-                    obs_x = env_origins[env_idx, 0] + course_start_x + wp_idx * obstacle_spacing_x
+                    # Obstacle center X position
+                    obs_x = env_origins[env_idx, 0] + offset_x + params["course_start_x"] + wp_idx * params["obstacle_spacing_x"]
                     
-                    # Zig-zag pattern
+                    # Zig-zag Y pattern
                     if wp_idx == 0:
-                        obs_y = env_origins[env_idx, 1] + lane_center_y  # Center
+                        obs_y = env_origins[env_idx, 1] + lane_center_y
                     elif wp_idx == 1:
-                        obs_y = env_origins[env_idx, 1] + lane_center_y - lateral_offset  # Left
-                    else:  # wp_idx == 2
-                        obs_y = env_origins[env_idx, 1] + lane_center_y + lateral_offset  # Right
+                        obs_y = env_origins[env_idx, 1] + lane_center_y - params["lateral_offset"]
+                    else:
+                        obs_y = env_origins[env_idx, 1] + lane_center_y + params["lateral_offset"]
                     
-                    # Waypoint is behind obstacle
-                    waypoint_x = obs_x + waypoint_distance_behind_obstacle
+                    # Waypoint BEHIND obstacle
+                    waypoint_x = obs_x + params["waypoint_distance_behind"]
                     waypoint_y = obs_y
                     
-                    # ✅ FIXED: Waypoint height stays close to base_height with small variation
-                    # Variation is ±0.2m to keep altitude consistent but not perfectly flat
                     z_variation = torch.zeros(1, device=self.device).uniform_(-0.2, 0.2).item()
                     waypoint_z = torch.clamp(
                         torch.tensor(base_height + z_variation, device=self.device),
-                        min=min_height,  # Never below minimum safe height
-                        max=max_height   # Never above maximum height
+                        min=min_height,
+                        max=max_height
                     ).item()
                     
-                    # Store waypoint in path buffer
+                    # Store waypoint
                     self._waypoint_paths[env_id_int, j, wp_idx, 0] = waypoint_x
                     self._waypoint_paths[env_id_int, j, wp_idx, 1] = waypoint_y
                     self._waypoint_paths[env_id_int, j, wp_idx, 2] = waypoint_z
                 
-                # Reset current waypoint index to 0 (first waypoint)
+                # Reset waypoint index
                 self._current_waypoint_idx[env_id_int, j] = 0
                 
-                # Set initial goal to first waypoint
+                # Set initial goal
                 self._desired_pos_w[env_id_single, j, :] = self._waypoint_paths[env_id_int, j, 0, :]
-   
-    ###---- Stage 4: Swarm Navigation ----###
-    #TODO adjust this stage to also use the swarm centroid waypoint logic
+        
+        #print(f"[INFO] Stage 3 reset complete using shared parameters")
+       
     def _set_stage4_positions(self, env_ids, env_origins):
         """Set swarm navigation goals with formation aligned to travel direction."""
         num_reset_envs = len(env_ids)
@@ -2320,7 +2457,6 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 self._desired_pos_w[env_id_single, j, 1] = goal_y
                 self._desired_pos_w[env_id_single, j, 2] = goal_z
 
-    ###---- Stage 5: Swarm Navigation with Obstacles ----### 
     def _set_stage5_positions(self, env_ids, env_origins):
         """Set swarm waypoint navigation through stacked X obstacle pattern.
         
@@ -2336,7 +2472,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             env_origins: Origins of environments, shape (num_reset_envs, 3)
         """
         num_reset_envs = len(env_ids)
-        offset_x, offset_y = self._get_stage_offset()  # Returns (0.0, 20.0) for stage 5
+        offset_x, offset_y = (0,0)
         
         # Get obstacle configuration
         x_offset = self.cfg.curriculum.stage5_obsx_offset
@@ -2458,7 +2594,19 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         #print(f"[Stage 5] Initialized swarm obstacle navigation with {self.num_swarm_waypoints} waypoints")
         #print(f"[Stage 5] Formation rotated 90° to face +Y direction (toward obstacles)")
 
-###---- Formation Helper Method: Inverted V Formation ----###
+
+###---- Swarm formation methods ----###
+    def _compute_swarm_centroid(self):
+            """Compute swarm centroid position for each environment (Stages 4 & 5).
+            
+            Calculates the mean position of all drones in each environment.
+            Updates the _swarm_centroid buffer: (num_envs, 3)
+            """
+            # Stack all drone positions: (num_envs, num_drones, 3)
+            swarm_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=1)
+            
+            # Compute centroid as mean across all drones: (num_envs, 3)
+            self._swarm_centroid = swarm_positions.mean(dim=1)
 
     def get_inverted_v_formation(self, env_ids: torch.Tensor, env_origins: torch.Tensor, spawn_heights: torch.Tensor) -> torch.Tensor:
         """Calculate inverted V formation positions for all drones in specified environments.
@@ -2475,11 +2623,11 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         num_reset_envs = len(env_ids)
         
         # Inverted V: apex at front (negative X), wings spread backward and outward
-        v_angle_rad = torch.deg2rad(torch.tensor(self.cfg.formation_v_angle_deg, device=self.device))
-        base_sep = self.cfg.formation_base_separation
+        v_angle_rad = torch.deg2rad(torch.tensor(self.cfg.swarm_cfg.formation_v_angle_deg, device=self.device))
+        base_sep = self.cfg.swarm_cfg.formation_base_separation
         
         # Scale separation based on max_num_agents to ensure formation fits
-        scale_factor = max(1.0, self.cfg.min_sep / base_sep)
+        scale_factor = max(1.0, self.cfg.swarm_cfg.min_safe_distance / base_sep)
         effective_sep = base_sep * scale_factor
         
         # Generate formation positions template for each drone
@@ -2492,7 +2640,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             # Multiple drones: inverted V formation
             # Apex drone (index 0) at the front (negative X)
             apex_idx = 0
-            formation_template[apex_idx, 0] = self.cfg.formation_apex_offset  # X position (front)
+            formation_template[apex_idx, 0] = self.cfg.swarm_cfg.formation_apex_offset  # X position (front)
             formation_template[apex_idx, 1] = 0.0  # Y position (centered)
             
             # Distribute remaining drones on left and right wings
@@ -2505,7 +2653,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 wing_idx = i + 1
                 x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
                 y_offset = -(i + 1) * effective_sep * torch.sin(v_angle_rad)  # Left
-                formation_template[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
+                formation_template[wing_idx, 0] = self.cfg.swarm_cfg.formation_apex_offset + x_offset
                 formation_template[wing_idx, 1] = y_offset
             
             # Right wing (positive Y)
@@ -2513,7 +2661,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 wing_idx = left_wing_count + i + 1
                 x_offset = (i + 1) * effective_sep * torch.cos(v_angle_rad)  # Backward
                 y_offset = (i + 1) * effective_sep * torch.sin(v_angle_rad)  # Right
-                formation_template[wing_idx, 0] = self.cfg.formation_apex_offset + x_offset
+                formation_template[wing_idx, 0] = self.cfg.swarm_cfg.formation_apex_offset + x_offset
                 formation_template[wing_idx, 1] = y_offset
     
         # Verify minimum separation constraint
@@ -2524,8 +2672,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             min_dist = dists.min()
             
             # If constraint violated, scale up the formation
-            if min_dist < self.cfg.min_sep:
-                scale_up = self.cfg.min_sep / min_dist
+            if min_dist < self.cfg.swarm_cfg.min_safe_distance:
+                scale_up = self.cfg.swarm_cfg.min_safe_distance / min_dist
                 formation_template[:, :2] *= scale_up
     
         # Expand template to all resetting environments
@@ -2545,18 +2693,3 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return formation_positions  # Shape: (num_reset_envs, num_drones, 3)
     
-    def _get_stage_offset(self) -> tuple[float, float]:
-        """Get the XY offset for the current curriculum stage.
-        
-        Returns:
-            Tuple of (offset_x, offset_y) for the current stage
-        """
-        stage = self.curriculum_stage
-        
-        if stage == 3:
-            return (self.cfg.curriculum.stage3_offset_x, self.cfg.curriculum.stage3_offset_y)
-        elif stage == 5:
-            return (self.cfg.curriculum.stage5_offset_x, self.cfg.curriculum.stage5_offset_y)
-        else:
-            # Stages 1, 2, 4: use default origin (0, 0)
-            return (0.0, 0.0)
