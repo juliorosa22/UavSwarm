@@ -47,7 +47,7 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 
 @configclass
 class CurriculumCfg:
-    active_stage: int = 1  # Current active stage (1 to 5)
+    active_stage: int = 4  # Current active stage (1 to 5)
     
 # ✅ NEW: Episode durations per stage
     stage1_episode_length_s: float = 30.0   # Hover
@@ -83,7 +83,7 @@ class CurriculumCfg:
     # Stage 5 obstacle distribution (stacked X pattern)
     stage5_obsx_offset: float = 1.5  # X spacing between wall segments in X pattern
     stage5_obsy_offset: float = 2.0  # Y spacing between wall segments in X pattern
-    dist_from_spawn_swarm: float = 2.0  # Distance from spawn to first obstacle in swarm stage
+    dist_from_spawn_swarm: float = 1.5  # Distance from spawn to first obstacle in swarm stage
     ##--- Common parameters ---##
     spawn_height_range: tuple = (0.5, 0.8)  # spawn height range for all stages
     spawn_grid_spacing_range: tuple = (0.5, 0.8)  # spacing range for grid spawn positions 
