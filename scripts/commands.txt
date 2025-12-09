@@ -1,5 +1,5 @@
 train hover:
-python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --algorithm MAPPO
+python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --algorithm MAPPO  --video --video_length 120 --video_interval 1000
 
 play:
-python scripts/skrl/play.py --task=FullTask-UAVSwarm-Direct-v0 --algorithm MAPPO --num_envs 32 --checkpoint /home/julio/UavSwarm/logs/skrl/hover_stage_mappo/2025-12-07_18-08-01_mappo_torch/checkpoints/agent_50000.pt
+python scripts/skrl/play.py --task=FullTask-UAVSwarm-Direct-v0 --algorithm MAPPO --num_envs 32 --checkpoint logs/skrl/hover_stage_mappo_v2/2025-12-08_20-16-07_mappo_torch/checkpoints/agent_30000.pt

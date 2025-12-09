@@ -15,8 +15,8 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [64, 64, 32]  # ✅ Deeper network for complex RM state reasoning
-        activations: elu
+        layers: [128, 128, 64, 64]  # ✅ Deeper network for complex RM state reasoning
+        activations: relu
     output: ACTIONS
   value:  # see deterministic_model parameters
     class: DeterministicMixin
@@ -24,8 +24,8 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [64, 64, 32]  # ✅ Match policy network depth
-        activations: elu
+        layers: [128, 128, 64, 64]  # ✅ Match policy network depth
+        activations: relu
     output: ONE
 
 
@@ -68,7 +68,7 @@ agent:
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "hover_stage_mappo"  # ✅ Updated directory name for curriculum learning
+    directory: "p2p_stage_mappo_v1"  # ✅ Updated directory name for curriculum learning
     experiment_name: ""
     write_interval: 500  # ✅ Changed from auto - log every 500 steps
     checkpoint_interval: 5000  # ✅ Changed from auto - save every 5000 steps
@@ -78,5 +78,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 50000  # ✅ Increased from 30000 - curriculum learning needs more time
+  timesteps: 100000  # ✅ Increased from 30000 - curriculum learning needs more time
   environment_info: log

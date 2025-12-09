@@ -437,7 +437,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return state
 
-    def _get_rewards(self) -> dict[str, torch.Tensor]:
+    def _get_rewards_old(self) -> dict[str, torch.Tensor]:
         """RM state-aware reward calculation with behavior-specific guidance.
         
         Strategy:
@@ -656,325 +656,238 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return {f"robot_{i}": reward for i in range(self.num_drones)}
 
-#------Disabled RayCaster related functions for now as the sensor is not stable yet with multiple obstacles and MARL envs.
-    def _get_raycaster_data(self, robot_index: int) -> torch.Tensor:
-        """Get RayCaster distance measurements for a specific robot.
+    def _get_rewards(self) -> dict[str, torch.Tensor]:
+        """Smooth state-adaptive reward with continuous potential-based terms.
         
-        Args:
-            robot_index: Index of the robot (0 to num_drones-1)
+        Reward structure:
+        - Distance term: Main objective (always active)
+        - Obstacle term: Quadratic repulsive potential (active in stages 3, 5)
+        - Cooperation term: Laplace potential for neighbor distance (active in stages 4, 5)
         
-        Returns:
-            Tensor of ray distances, shape (num_envs, num_rays)
-            Invalid rays are clamped to max_distance
+        Smoothness:
+        - Weighted sum adapts based on RM state and curriculum stage
+        - All terms are continuous (no discrete switches)
+        - Final reward bounded via tanh transformation
         """
-        ray_caster = self._ray_casters[robot_index]
         
-        # Check if data exists and has correct shape
-        if hasattr(ray_caster.data, 'ray_distances') and ray_caster.data.ray_distances is not None:
-            ray_distances = ray_caster.data.ray_distances  # Shape: (num_envs, num_rays)
+        # Stack all robot data: (num_drones, num_envs, 3)
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
+        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
+        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
+        
+        desired_transposed = self._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+        
+        # ========================================
+        # 1. DISTANCE TERM (MAIN OBJECTIVE)
+        # ========================================
+        # Euclidean distance to goal: (num_drones, num_envs)
+        distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)
+        
+        # ✅ SMOOTH: Linear penalty approaching 0 at goal
+        # Range: [-∞, 0] (becomes 0 when distance = 0)
+        distance_term = -distances  # (num_drones, num_envs)
+        
+        # ========================================
+        # 2. OBSTACLE TERM (QUADRATIC REPULSIVE POTENTIAL)
+        # ========================================
+        if self.curriculum_stage in [3, 5]:
+            # Get nearest obstacle distance: (num_drones, num_envs)
+            obstacle_dists = self._get_nearest_obstacle_distance_vectorized(all_positions)
             
-            # Handle invalid rays (rays that didn't hit anything)
-            # Invalid rays return -1.0, replace with max_distance
-            ray_distances = torch.where(
-                ray_distances < 0.0,
-                torch.full_like(ray_distances, self.cfg.ray_max_distance),
-                ray_distances
-            )
+            # ✅ QUADRATIC POTENTIAL: Repulsion increases quadratically as distance decreases
+            # d_safe = 1.5m (safe threshold)
+            # Penalty = -k * max(0, (d_safe - d))^2
+            d_safe = 1.5
+            k_obs = 2.0  # Strength coefficient
             
-            # Clamp to valid range [0, max_distance]
-            ray_distances = torch.clamp(ray_distances, 0.0, self.cfg.ray_max_distance)
+            violations = torch.clamp(d_safe - obstacle_dists, min=0.0)  # (num_drones, num_envs)
+            obstacle_term = -k_obs * (violations ** 2)  # (num_drones, num_envs)
         else:
-            # ✅ FALLBACK: If sensor not ready, return max distances
-            ray_distances = torch.full(
-                (self.num_envs, self.cfg.num_rays), 
-                self.cfg.ray_max_distance, 
-                device=self.device
-            )
+            # No obstacles in stages 1, 2, 4
+            obstacle_term = torch.zeros_like(distance_term)
         
-        return ray_distances
-
-    def _build_single_observation(self, robot_idx: int) -> torch.Tensor:
-        """Build observation vector for a single robot (used by both policy and critic).
-        
-        Args:
-            robot_idx: Index of the robot (0 to num_drones-1)
-        
-        Returns:
-            Observation tensor of shape (num_envs, 23):
-            - [0:3]: Linear velocity (body frame)
-            - [3:6]: Angular velocity (body frame)
-            - [6:9]: Projected gravity (body frame)
-            - [9:12]: Desired position (body frame)
-            - [12]: Nearest obstacle distance
-            - [13:16]: Neighbor relative velocity (body frame)
-            - [16:19]: Neighbor relative position (body frame)
-            - [19:23]: RM state (one-hot encoded)
-        """
-        rob = self._robots[robot_idx]
-        
-        # Transform desired position to body frame
-        desired_pos_b, _ = subtract_frame_transforms(
-            rob.data.root_pos_w, 
-            rob.data.root_quat_w, 
-            self._desired_pos_w[:, robot_idx, :]
-        )
-        
-        # Get distance to nearest obstacle
-        nearest_obstacle_dist = self._get_nearest_obstacle_distance(rob.data.root_pos_w)  # (num_envs,)
-        
-        # Get nearest neighbor data (stage-aware: defaults in stages 1-3, actual in stages 4-5)
-        neighbor_rel_pos_w, neighbor_rel_vel_w = self._get_nearest_neighbor_data(robot_idx)  # Each: (num_envs, 3)
-        
-        # Transform neighbor relative data to agent's body frame
-        neighbor_rel_pos_b, _ = subtract_frame_transforms(
-            rob.data.root_pos_w,
-            rob.data.root_quat_w,
-            rob.data.root_pos_w + neighbor_rel_pos_w  # Convert relative to absolute, then to body frame
-        )
-        
-        # Relative velocity in body frame
-        from isaaclab.utils.math import quat_apply_inverse
-        neighbor_rel_vel_b = quat_apply_inverse(rob.data.root_quat_w, neighbor_rel_vel_w)
-        
-        # Get RM state as one-hot encoding
-        # self._rm_states[:, robot_idx] has shape (num_envs,) with values in {0, 1, 2, 3}
-        # One-hot encoding: (num_envs, 4)
-        rm_state_onehot = torch.nn.functional.one_hot(
-            self._rm_states[:, robot_idx], 
-            num_classes=self.cfg.reward_cfg.num_rm_states
-        ).float()  # (num_envs, 4)
-        
-        # Concatenate observation components
-        obs = torch.cat(
-            [
-                rob.data.root_lin_vel_b,                # (num_envs, 3) - own velocity
-                rob.data.root_ang_vel_b,                # (num_envs, 3) - own angular velocity
-                rob.data.projected_gravity_b,           # (num_envs, 3) - gravity direction
-                desired_pos_b,                          # (num_envs, 3) - goal position
-                nearest_obstacle_dist.unsqueeze(-1),    # (num_envs, 1) - obstacle distance
-                neighbor_rel_vel_b,                     # (num_envs, 3) - neighbor relative velocity
-                neighbor_rel_pos_b,                     # (num_envs, 3) - neighbor relative position
-                rm_state_onehot,                        # (num_envs, 4) - RM state (one-hot)
-            ],
-            dim=-1,
-        )  # -> (num_envs, 23)
-        
-        return obs
-
-    def _get_observations_slow(self) -> dict:
-        """Get observations for each drone including RM state (one-hot encoded).
-        
-        Neighbor observations behavior:
-        - Stages 1-3: Returns neutral defaults (far away, no velocity)
-        - Stages 4-5: Returns actual nearest neighbor data
-        
-        RM state encoding (one-hot):
-        - [1, 0, 0, 0]: Hovering (H)
-        - [0, 1, 0, 0]: Single-moving (S)
-        - [0, 0, 1, 0]: Coop-moving (C)
-        - [0, 0, 0, 1]: Obstacle-avoiding (O)
-        
-        Returns:
-            Dictionary mapping agent names directly to observations.
-            Format: {"robot_0": obs0, "robot_1": obs1, ...}
-        """
-        # ✅ UPDATE RM STATES FIRST (before generating observations)
-        self._switch_rm_state()
-        
-        obs_dict = {}
-        
-        for j in range(self.num_drones):
-            agent_name = f"robot_{j}"
-            obs_dict[agent_name] = self._build_single_observation(j)
-        
-
-        
-        if hasattr(self, '_debug_obs_counter'):
-            self._debug_obs_counter += 1
-        else:
-            self._debug_obs_counter = 0
-        
-        # Print every 100 steps to avoid spam
-        # if self._debug_obs_counter % 100 == 0:
-        #     agent_0_obs = obs_dict["robot_0"][0]  # First environment, agent 0
-        #     agent_0_rm_state = self._rm_states[0, 0].item()  # First environment, agent 0
-            
-        #     print(f"\n[DEBUG] Agent_0 Observation (env 0, step {self._debug_obs_counter}):")
-        #     print(f"  RM State: {agent_0_rm_state} ({self._rm_state_names[agent_0_rm_state]})")
-        #     print(f"  Lin Vel (body):       {agent_0_obs[0:3].cpu().numpy()}")
-        #     print(f"  Ang Vel (body):       {agent_0_obs[3:6].cpu().numpy()}")
-        #     print(f"  Gravity (body):       {agent_0_obs[6:9].cpu().numpy()}")
-        #     print(f"  Desired Pos (body):   {agent_0_obs[9:12].cpu().numpy()}")
-        #     print(f"  Nearest Obstacle:     {agent_0_obs[12].item():.3f}m")
-        #     print(f"  Neighbor Rel Vel:     {agent_0_obs[13:16].cpu().numpy()}")
-        #     print(f"  Neighbor Rel Pos:     {agent_0_obs[16:19].cpu().numpy()}")
-        #     print(f"  RM State (one-hot):   {agent_0_obs[19:23].cpu().numpy()}")
-        #     print(f"  Total obs shape:      {agent_0_obs.shape}")
-
-
-        return obs_dict
-    
-    def _get_rewards_slow(self) -> dict[str, torch.Tensor]:
-        """Calculate RM state-aware rewards for curriculum learning.
-        
-        Reward components:
-        - Base rewards: velocity penalties, goal progress
-        - Formation rewards: cohesion, collision avoidance (stages 4-5)
-        - RM state-aware bonuses: altitude control, obstacle avoidance, neighbor coordination
-        
-        Returns:
-            Dictionary mapping agent names to reward tensors of shape (num_envs,)
-        """
-        # -----------------------------------------------------
-        # 1. BASE REWARDS
-        # -----------------------------------------------------
-        lin_vel_sum = torch.zeros(self.num_envs, device=self.device)
-        ang_vel_sum = torch.zeros(self.num_envs, device=self.device)
-        dist_goal_sum = torch.zeros(self.num_envs, device=self.device)
-
-        pos_list = []
-
-        # Per-drone base rewards
-        for j, rob in enumerate(self._robots):
-            lin_vel = torch.sum(torch.square(rob.data.root_lin_vel_b), dim=1)
-            ang_vel = torch.sum(torch.square(rob.data.root_ang_vel_b), dim=1)
-            
-            distance_to_goal = torch.linalg.norm(
-                self._desired_pos_w[:, j, :] - rob.data.root_pos_w, dim=1
-            )
-            distance_to_goal_mapped = 1 - torch.tanh(distance_to_goal / 0.8)
-
-            # ✅ State-dependent scaling for velocity penalties
-            # Hovering state: penalize motion more heavily
-            # Moving states: penalize less to allow navigation
-            is_hovering = (self._rm_states[:, j] == 0).float()  # (num_envs,)
-            vel_scale = 1.0 + 0.5 * is_hovering  # 1.5x penalty when hovering, 1.0x otherwise
-
-            lin_vel_sum += lin_vel * vel_scale * self.cfg.reward_cfg.lin_vel_reward_scale * self.step_dt
-            ang_vel_sum += ang_vel * vel_scale * self.cfg.reward_cfg.ang_vel_reward_scale * self.step_dt
-            dist_goal_sum += distance_to_goal_mapped * self.cfg.reward_cfg.distance_to_goal_reward_scale * self.step_dt
-
-            pos_list.append(rob.data.root_pos_w)
-
-        # -----------------------------------------------------
-        # 2. SWARM FORMATION REWARDS (stages 4-5 only)
-        # -----------------------------------------------------
-        formation_pen = torch.zeros(self.num_envs, device=self.device)
-        collision_pen = torch.zeros(self.num_envs, device=self.device)
-        
-        positions = torch.stack(pos_list, dim=1)  # (num_envs, num_drones, 3)
-        
+        # ========================================
+        # 3. COOPERATION TERM (LAPLACE POTENTIAL)
+        # ========================================
         if self.curriculum_stage in [4, 5]:
-            dmat = torch.cdist(positions, positions)  # pairwise distances
-
-            # Formation penalty: too close or too dispersed
-            too_close = torch.clamp(self.cfg.swarm_cfg.min_safe_distance - dmat, min=0.0)
-            mean_dist = torch.mean(dmat, dim=(1, 2))
-            formation_pen = self.cfg.reward_cfg.formation_penalty_scale * (
-                torch.mean(too_close, dim=(1, 2)) + 
-                torch.clamp(mean_dist - self.cfg.swarm_cfg.max_formation_distance, min=0.0)
-            ) * self.step_dt
-
-        # Collision penalty: any drone below minimum height (all stages)
-        collided = positions[:, :, 2] < 0.1
-        collision_pen = self.cfg.reward_cfg.collision_penalty_scale * collided.any(dim=1).float() * self.step_dt
-
-        # -----------------------------------------------------
-        # 3. ✅ NEW: RM STATE-AWARE BONUSES
-        # -----------------------------------------------------
-        altitude_bonus = torch.zeros(self.num_envs, device=self.device)
-        obstacle_bonus = torch.zeros(self.num_envs, device=self.device)
-        neighbor_bonus = torch.zeros(self.num_envs, device=self.device)
-        state_transition_bonus = torch.zeros(self.num_envs, device=self.device)
-
-        for j, rob in enumerate(self._robots):
-            current_state = self._rm_states[:, j]  # (num_envs,)
-            agent_z = rob.data.root_pos_w[:, 2]  # (num_envs,)
+            # Compute pairwise distances: (num_drones, num_drones, num_envs)
+            diff = all_positions.unsqueeze(1) - all_positions.unsqueeze(0)  # (num_drones, num_drones, num_envs, 3)
+            pairwise_dists = torch.linalg.norm(diff, dim=3)  # (num_drones, num_drones, num_envs)
             
-            # -----------------------------------------------
-            # 3.1 ALTITUDE CONTROL BONUS (Hovering state)
-            # -----------------------------------------------
-            # Reward maintaining target altitude when hovering
-            is_hovering = (current_state == 0).float()
-            target_altitude = self._desired_pos_w[:, j, 2]  # (num_envs,)
-            altitude_error = torch.abs(agent_z - target_altitude)
-            altitude_bonus_per_agent = torch.exp(-altitude_error) * is_hovering  # Exponential decay with error
-            altitude_bonus += altitude_bonus_per_agent * self.cfg.reward_cfg.altitude_bonus_scale * self.step_dt
+            # Mask self-distances
+            eye_mask = torch.eye(self.num_drones, device=self.device).unsqueeze(2)  # (num_drones, num_drones, 1)
+            pairwise_dists = pairwise_dists + eye_mask * 1e6
             
-            # -----------------------------------------------
-            # 3.2 OBSTACLE AVOIDANCE BONUS (Obstacle-avoiding state)
-            # -----------------------------------------------
-            # Reward maintaining safe distance from obstacles
-            is_avoiding = (current_state == 3).float()
-            nearest_obs_dist = self._get_nearest_obstacle_distance(rob.data.root_pos_w)  # (num_envs,)
+            # Get nearest neighbor distance for each agent: (num_drones, num_envs)
+            neighbor_dists = pairwise_dists.min(dim=1)[0]
             
-            # Bonus increases with distance (up to safe threshold)
-            safe_distance = 2.0  # meters
-            obstacle_clearance_ratio = torch.clamp(nearest_obs_dist / safe_distance, 0.0, 1.0)
-            obstacle_bonus_per_agent = obstacle_clearance_ratio * is_avoiding
-            obstacle_bonus += obstacle_bonus_per_agent * self.cfg.reward_cfg.obstacle_bonus_scale * self.step_dt
+            # ✅ LAPLACE POTENTIAL: Penalizes both too close and too spread
+            # V(d) = -k * |d - d_opt|
+            # d_min = 0.5m (collision threshold)
+            # d_max = 3.0m (max coordination distance)
+            # d_opt = (d_min + d_max) / 2 = 1.75m (optimal spacing)
             
-            # -----------------------------------------------
-            # 3.3 NEIGHBOR COORDINATION BONUS (Coop-moving state)
-            # -----------------------------------------------
-            # Reward maintaining optimal neighbor distance (stages 4-5)
-            if self.curriculum_stage in [4, 5]:
-                is_cooperating = (current_state == 2).float()
-                neighbor_rel_pos, _ = self._get_nearest_neighbor_data(j)
-                neighbor_dist = torch.linalg.norm(neighbor_rel_pos, dim=1)  # (num_envs,)
-                
-                # Optimal neighbor distance: 1.0m (half of max_neighbor_distance)
-                optimal_distance = self.cfg.swarm_cfg.max_neighbor_distance / 2.0
-                neighbor_error = torch.abs(neighbor_dist - optimal_distance)
-                neighbor_bonus_per_agent = torch.exp(-neighbor_error / optimal_distance) * is_cooperating
-                neighbor_bonus += neighbor_bonus_per_agent * self.cfg.reward_cfg.neighbor_bonus_scale * self.step_dt
+            d_min = 0.5
+            d_max = 3.0
+            d_opt = (d_min + d_max) / 2.0  # 1.75m
+            k_coop = 1.0  # Strength coefficient
             
-            # -----------------------------------------------
-            # 3.4 STATE TRANSITION BONUS (Curriculum progression)
-            # -----------------------------------------------
-            # Small bonus for entering advanced states (encourages progression)
-            # Hovering: 0, Single-moving: +0.05, Coop-moving: +0.10, Obstacle-avoiding: +0.15
-            state_value = current_state.float() * self.cfg.reward_cfg.state_progress_scale
-            state_transition_bonus += state_value * self.step_dt
-
-        # -----------------------------------------------------
-        # 4. COMBINE ALL REWARD COMPONENTS
-        # -----------------------------------------------------
-        # Total reward (shared across all agents in cooperative setting)
-        reward = (
-            lin_vel_sum +           # Penalty (negative)
-            ang_vel_sum +           # Penalty (negative)
-            dist_goal_sum +         # Reward (positive)
-            formation_pen +         # Penalty (negative)
-            collision_pen +         # Penalty (negative)
-            altitude_bonus +        # ✅ NEW: Bonus (positive)
-            obstacle_bonus +        # ✅ NEW: Bonus (positive)
-            neighbor_bonus +        # ✅ NEW: Bonus (positive)
-            state_transition_bonus  # ✅ NEW: Bonus (positive)
-        )
-
-        # -----------------------------------------------------
-        # 5. LOGGING
-        # -----------------------------------------------------
-        self._episode_sums["lin_vel"] += lin_vel_sum
-        self._episode_sums["ang_vel"] += ang_vel_sum
-        self._episode_sums["distance_to_goal"] += dist_goal_sum
-        self._episode_sums["formation"] += formation_pen
-        self._episode_sums["collision"] += collision_pen
+            # Absolute deviation from optimal distance
+            deviation = torch.abs(neighbor_dists - d_opt)  # (num_drones, num_envs)
+            
+            # Extra penalty for violating hard constraints
+            too_close_penalty = torch.clamp(d_min - neighbor_dists, min=0.0) * 5.0
+            too_far_penalty = torch.clamp(neighbor_dists - d_max, min=0.0) * 2.0
+            
+            coop_term = -k_coop * deviation - too_close_penalty - too_far_penalty  # (num_drones, num_envs)
+        else:
+            # No cooperation in stages 1, 2, 3
+            coop_term = torch.zeros_like(distance_term)
         
-        # ✅ NEW: Log RM state-aware bonuses
-        if "altitude" not in self._episode_sums:
-            self._episode_sums["altitude"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            self._episode_sums["obstacle_avoid"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            self._episode_sums["neighbor_coord"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-            self._episode_sums["state_progress"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        # ========================================
+        # 4. STATE-ADAPTIVE WEIGHTING
+        # ========================================
+        # Get RM states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
+        rm_states = self._rm_states.transpose(0, 1)
         
-        self._episode_sums["altitude"] += altitude_bonus
-        self._episode_sums["obstacle_avoid"] += obstacle_bonus
-        self._episode_sums["neighbor_coord"] += neighbor_bonus
-        self._episode_sums["state_progress"] += state_transition_bonus
-
-        # Return dictionary with same reward for all agents (cooperative setting)
+        # Initialize weights
+        w_dist = torch.ones_like(distance_term)  # (num_drones, num_envs)
+        w_obs = torch.zeros_like(distance_term)
+        w_coop = torch.zeros_like(distance_term)
+        
+        # ✅ STAGE 1, 2: Pure distance-based (no obstacles, no cooperation)
+        if self.curriculum_stage in [1, 2]:
+            w_dist = 1.0
+            w_obs = 0.0
+            w_coop = 0.0
+        
+        # ✅ STAGE 3: Distance + Obstacle avoidance
+        elif self.curriculum_stage == 3:
+            # State masks: (num_drones, num_envs)
+            is_avoiding = (rm_states == 3).float()
+            is_other = 1.0 - is_avoiding
+            
+            # Avoiding state: Reduce distance weight, increase obstacle weight
+            w_dist = 0.75 * is_avoiding + 1.0 * is_other
+            w_obs = 0.25 * is_avoiding + 0.0 * is_other
+            w_coop = 0.0
+        
+        # ✅ STAGE 4: Distance + Cooperation (no obstacles)
+        elif self.curriculum_stage == 4:
+            # State masks
+            is_cooperating = (rm_states == 2).float()
+            is_other = 1.0 - is_cooperating
+            
+            # Cooperating state: Reduce distance weight, increase coop weight
+            w_dist = 0.7 * is_cooperating + 1.0 * is_other
+            w_obs = 0.0
+            w_coop = 0.3 * is_cooperating + 0.0 * is_other
+        
+        # ✅ STAGE 5: Distance + Obstacle + Cooperation
+        elif self.curriculum_stage == 5:
+            # State masks
+            is_avoiding = (rm_states == 3).float()
+            is_cooperating = (rm_states == 2).float()
+            is_other = 1.0 - is_avoiding - is_cooperating
+            
+            # Avoiding state: Balance all three terms
+            w_dist_avoiding = 0.7
+            w_obs_avoiding = 0.2
+            w_coop_avoiding = 0.1
+            
+            # Cooperating state: Emphasize cooperation
+            w_dist_coop = 0.75
+            w_obs_coop = 0.05
+            w_coop_coop = 0.2
+            
+            # Other states: Mainly distance
+            w_dist_other = 1.0
+            w_obs_other = 0.0
+            w_coop_other = 0.0
+            
+            # Blend weights
+            w_dist = (w_dist_avoiding * is_avoiding + 
+                    w_dist_coop * is_cooperating + 
+                    w_dist_other * is_other)
+            
+            w_obs = (w_obs_avoiding * is_avoiding + 
+                    w_obs_coop * is_cooperating + 
+                    w_obs_other * is_other)
+            
+            w_coop = (w_coop_avoiding * is_avoiding + 
+                    w_coop_coop * is_cooperating + 
+                    w_coop_other * is_other)
+        
+        # ========================================
+        # 5. WEIGHTED SUM (UNBOUNDED)
+        # ========================================
+        raw_reward = (
+            w_dist * distance_term +   # Main objective
+            w_obs * obstacle_term +    # Obstacle avoidance
+            w_coop * coop_term         # Swarm cooperation
+        )  # (num_drones, num_envs)
+        
+        # ========================================
+        # 6. SMOOTH BOUNDING VIA TANH
+        # ========================================
+        # Map unbounded reward to bounded range using tanh
+        # tanh(x) ∈ [-1, 1], scaled to desired range
+        
+        # Scale factor: controls sensitivity
+        # Smaller scale → more gradual saturation
+        # Larger scale → sharper transitions
+        scale = 0.5
+        
+        # ✅ BOUNDED REWARD: Maps to approximately [-2, +2]
+        bounded_reward = 2.0 * torch.tanh(scale * raw_reward)  # (num_drones, num_envs)
+        
+        # ========================================
+        # 7. AGGREGATE ACROSS AGENTS (MEAN)
+        # ========================================
+        # Average reward across all agents for cooperative setting
+        mean_reward_per_env = bounded_reward.mean(dim=0)  # (num_envs,)
+        
+        # ========================================
+        # 8. ADDITIONAL PENALTIES (SAFETY)
+        # ========================================
+        # Collision penalty (ground/ceiling)
+        agent_z = all_positions[:, :, 2]  # (num_drones, num_envs)
+        too_low = agent_z < self.cfg.reward_cfg.min_flight_height
+        too_high = agent_z > self.cfg.reward_cfg.max_flight_height
+        collision = -(too_low | too_high).any(dim=0).float() * 10.0  # (num_envs,)
+        
+        # Velocity penalties (encourage smooth control)
+        lin_vel_penalty = torch.sum(all_lin_vels ** 2, dim=2).mean(dim=0) * -0.005
+        ang_vel_penalty = torch.sum(all_ang_vels ** 2, dim=2).mean(dim=0) * -0.0025
+        
+        # ========================================
+        # 9. FINAL REWARD
+        # ========================================
+        reward = mean_reward_per_env + collision + lin_vel_penalty + ang_vel_penalty
+        
+        # ========================================
+        # 10. LOGGING
+        # ========================================
+        mean_distance_to_goal = distances.mean(dim=0)
+        self._episode_sums["distance_to_goal"] += mean_distance_to_goal
+        self._episode_sums["lin_vel"] += -lin_vel_penalty
+        self._episode_sums["ang_vel"] += -ang_vel_penalty
+        self._episode_sums["collision"] += -collision
+        
+        if "mean_reward" not in self._episode_sums:
+            self._episode_sums["mean_reward"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self._episode_sums["mean_reward"] += reward
+        
+        # Log individual reward components (for debugging)
+        if "dist_component" not in self._episode_sums:
+            self._episode_sums["dist_component"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self._episode_sums["obs_component"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+            self._episode_sums["coop_component"] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        
+        self._episode_sums["dist_component"] += (w_dist * distance_term).mean(dim=0)
+        self._episode_sums["obs_component"] += (w_obs * obstacle_term).mean(dim=0)
+        self._episode_sums["coop_component"] += (w_coop * coop_term).mean(dim=0)
+        
         return {f"robot_{i}": reward for i in range(self.num_drones)}
 
 #----Termination Conditions with Curriculum Awareness----#  
@@ -1391,9 +1304,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         new_states = torch.zeros_like(all_z, dtype=torch.long)  # (num_drones, num_envs)
         
         # Check conditions
-        above_hover = all_z > self.cfg.reward_cfg.hover_min_altitude
-        far_from_obstacle = nearest_obstacle_dists > self.cfg.reward_cfg.close_obs_dist_thresh
-        near_neighbor = neighbor_dists < self.cfg.swarm_cfg.max_neighbor_distance
+        above_hover = all_z > self.cfg.reward_cfg.exit_hover_altitude
+        far_from_obstacle = nearest_obstacle_dists > self.cfg.reward_cfg.enter_obstacle_avoidance_dist
+        near_neighbor = neighbor_dists < self.cfg.reward_cfg.enter_coop_moving_dist
         
         # Apply state transitions (order matters - later assignments override earlier ones)
         # State 1 (S): Above hover AND far from obstacle AND far from neighbor
@@ -1527,24 +1440,6 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         bonus = bonus_per_agent.sum(dim=0)
         
         return bonus * self.cfg.reward_cfg.neighbor_bonus_scale * self.step_dt
-
-    def _compute_state_bonus_vectorized(self) -> torch.Tensor:
-        """Vectorized state progression bonus computation.
-        
-        Returns:
-            State bonus summed across all agents, shape (num_envs,)
-        """
-        # _rm_states: (num_envs, num_drones) -> transpose -> (num_drones, num_envs)
-        rm_states_transposed = self._rm_states.transpose(0, 1).float()
-        
-        # State value: Hovering=0, Single-moving=1, Coop-moving=2, Obstacle-avoiding=3
-        # Multiply by scale to get bonus
-        state_value_per_agent = rm_states_transposed * self.cfg.reward_cfg.state_progress_scale
-        
-        # Sum across all agents: (num_envs,)
-        bonus = state_value_per_agent.sum(dim=0)
-        
-        return bonus * self.step_dt
 
 
 ###------ Distance based helpers ------###
@@ -2329,9 +2224,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 start_z = start_heights[j]
 
                 # ✅ DEBUG: Print drone positions
-                if env_idx == 0:  # Only print for first environment
-                    print(f"  - Drone {j}: pos=({start_x.item():.2f}, {start_y.item():.2f}, {start_z.item():.2f}), "
-                        f"goal=({start_x.item():.2f}, {start_y.item():.2f}, {goal_heights[j].item():.2f})")
+                # if env_idx == 0:  # Only print for first environment
+                #     print(f"  - Drone {j}: pos=({start_x.item():.2f}, {start_y.item():.2f}, {start_z.item():.2f}), "
+                #         f"goal=({start_x.item():.2f}, {start_y.item():.2f}, {goal_heights[j].item():.2f})")
                 
 
 

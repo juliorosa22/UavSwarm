@@ -119,6 +119,12 @@ class CurriculumCfg:
 class RewardMachineCfg:
     """Configuration for Reward Machine parameters."""
 
+    ### switch thresholds and reward scales for each RM state
+
+    exit_hover_altitude: float = 0.8  # Altitude to enter hovering state
+    enter_obstacle_avoidance_dist: float = 0.3  # Distance to enter obstacle
+    enter_coop_moving_dist: float = 3  # Distance to enter cooperating movement state
+
      # ----- Reward Machine States Parameters -----
     hover_min_altitude: float = 0.8  # Minimum altitude to exit hovering state
     close_obs_dist_thresh: float = 0.3  # Distance threshold to enter obstacle-avoiding state
@@ -154,14 +160,14 @@ class RewardMachineCfg:
     
     # ✅ NEW: Safe distance thresholds
     safe_obstacle_distance: float = 0.4  # Meters - distance considered "safe" from obstacles
-    optimal_neighbor_distance: float = 0.5  # Meters - target distance between cooperating neighbors
+    optimal_neighbor_distance: float = 1  # Meters - target distance between cooperating neighbors
 
 @configclass
 class SwarmParameterCfg:
     """Configuration for Swarm parameters."""
 
     # ----- Swarm Sensing Parameters -----
-    max_neighbor_distance: float = 15.0  # Maximum distance for neighbor sensing (meters)
+    max_neighbor_distance: float = 10.0  # Maximum distance for neighbor sensing (meters)
     min_safe_distance: float = 1       # Minimum safe distance between drones (meters)
     optimal_distance: float = 3.0        # Optimal distance for cooperation (meters)
     max_formation_distance: float = 6.0  # Maximum mean distance for formation
@@ -242,7 +248,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=256, env_spacing=10.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=512, env_spacing=10.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----
