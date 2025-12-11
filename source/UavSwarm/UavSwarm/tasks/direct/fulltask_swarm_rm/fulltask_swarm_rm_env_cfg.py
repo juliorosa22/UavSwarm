@@ -47,7 +47,7 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 
 @configclass
 class CurriculumCfg:
-    active_stage: int = 4  # Current active stage (1 to 5)
+    active_stage: int = 2  # Current active stage (1 to 5)
     
 # ✅ NEW: Episode durations per stage
     stage1_episode_length_s: float = 30.0   # Hover
@@ -85,7 +85,7 @@ class CurriculumCfg:
     stage5_obsy_offset: float = 2.0  # Y spacing between wall segments in X pattern
     dist_from_spawn_swarm: float = 1.5  # Distance from spawn to first obstacle in swarm stage
     ##--- Common parameters ---##
-    spawn_height_range: tuple = (0.5, 0.8)  # spawn height range for all stages
+    spawn_height_range: tuple = (0.8, 1.0)  # spawn height range for all stages
     spawn_grid_spacing_range: tuple = (0.5, 0.8)  # spacing range for grid spawn positions 
     goal_height_range: tuple = (1.5, 6.0)  # goal height range for all stages
     max_obstacle_distance: float = 10.0  # Maximum distance to clamp obstacle measurements (meters)
@@ -227,28 +227,13 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
         ),
     )
 
-    terrain = TerrainImporterCfg(
-        prim_path="/World/ground",
-        terrain_type="plane",
-        collision_group=-1,
-        physics_material=sim_utils.RigidBodyMaterialCfg(
-            friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
-            static_friction=1.0,
-            dynamic_friction=1.0,
-            restitution=0.0,
-        ),
-        visual_material=PreviewSurfaceCfg(
-            diffuse_color=(0.2, 0.2, 0.2),  # Dark gray (R, G, B)
-            roughness=0.8,
-            metallic=0.0,
-        ),
-        debug_vis=False,
-    )
+    cfg_ground = sim_utils.GroundPlaneCfg()
+    cfg_ground.func("/World/ground", cfg_ground)
+
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=512, env_spacing=10.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=256, env_spacing=10.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----
@@ -257,7 +242,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     ).replace(
         spawn=CRAZYFLIE_CFG.spawn.replace(
             visual_material=PreviewSurfaceCfg(
-                diffuse_color=(1.0, 0.0, 0.0),  # Black color (R, G, B)
+                diffuse_color=(1.0, 1.0, 0.0),  # Yellow color (R, G, B)
                 roughness=0.5,
                 metallic=0.2,
             ),

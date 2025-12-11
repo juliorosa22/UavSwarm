@@ -106,6 +106,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self.num_drones, self.num_envs, 3, device=self.device
         )  # (num_drones, num_envs, 3)
 
+        self._prev_distances = torch.zeros(self.num_drones, self.num_envs, device=self.device)
+        self._prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
+
         # ✅ NEW: Cache flag to ensure computations are done before use
         self._cache_valid = False
 
@@ -170,9 +173,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     def _setup_scene(self):
         """Setup the scene with terrain and N robots per environment."""
         # Terrain
-        self.cfg.terrain.num_envs = self.scene.cfg.num_envs
-        self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
-        self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        #self.cfg.terrain.num_envs = self.scene.cfg.num_envs
+        #self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
+        #self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
 
         # Create N Crazyflies per environment AND their sensors
         for i in range(self.num_drones):
@@ -206,8 +209,8 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     
     
         # Filter collisions
-        if self.device == "cpu":
-            self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
+        #if self.device == "cpu":
+        #    self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
         
         # Lighting
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -346,19 +349,24 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             )
 
         self._actions[env_ids] = 0.0
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
+        desired_transposed = self._desired_pos_w.transpose(0, 1)
+        initial_distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)
+        self._prev_distances = initial_distances
+        self._prev_actions[env_ids] = 0.0
         # ✅ NEW: Reset RM states to Hovering (0) for all agents
         self._rm_states[env_ids, :] = 0
         # -----------------------------------------------------
         # 3. GET ENV ORIGINS
         # -----------------------------------------------------
-        env_origins = self._terrain.env_origins[env_ids]
+        env_origins = self.scene.env_origins[env_ids]#self._terrain.env_origins[env_ids]
 
         # -----------------------------------------------------
         # 4. CURRICULUM LOGIC — SELECT THE RIGHT STAGE BEHAVIOR
         # -----------------------------------------------------
         # ✅ NEW: Only handle active stage (no offsets)
         stage = self.curriculum_stage
-        print(f"[INFO] Resetting to curriculum stage {stage}, Length: {self.cfg.curriculum.get_episode_length()}s")
+        #print(f"[INFO] Resetting to curriculum stage {stage}, Length: {self.cfg.curriculum.get_episode_length()}s")
         if stage == 1:
             self._set_stage1_positions(env_ids, env_origins)
         elif stage == 2:
@@ -481,6 +489,215 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         return state
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
+        """Energy-based reward with distance delta, velocity alignment, and RM state shaping."""
+        
+        self._ensure_cache_populated()
+        
+        # Stack all robot data: (num_drones, num_envs, 3)
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
+        all_quats = torch.stack([rob.data.root_quat_w for rob in self._robots], dim=0)
+        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
+        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
+        all_lin_vels_w = torch.stack([rob.data.root_lin_vel_w for rob in self._robots], dim=0)
+        
+        desired_transposed = self._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+        
+        # ========================================
+        # 1. POSITION ENERGY (Inverse Quadratic Potential)
+        # ========================================
+        distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
+        
+        k_pos = 10.0
+        position_energy = k_pos / (1.0 + distances ** 2)  # (num_drones, num_envs)
+        
+        # ========================================
+        # 2. DISTANCE DELTA (Progress Indicator)
+        # ========================================
+        if not hasattr(self, '_prev_distances'):
+            self._prev_distances = distances.clone()
+        
+        distance_delta = self._prev_distances - distances  # (num_drones, num_envs)
+        self._prev_distances = distances.clone()
+        
+        k_delta = 3.0
+        delta_term = k_delta * distance_delta  # (num_drones, num_envs)
+        
+        # ========================================
+        # 3. VELOCITY ALIGNMENT (Direction Efficiency)
+        # ========================================
+        goal_directions = desired_transposed - all_positions  # (num_drones, num_envs, 3)
+        goal_dist = torch.linalg.norm(goal_directions, dim=2, keepdim=True) + 1e-8
+        goal_directions_norm = goal_directions / goal_dist
+        
+        vel_mag = torch.linalg.norm(all_lin_vels_w, dim=2, keepdim=True) + 1e-8
+        vel_directions_norm = all_lin_vels_w / vel_mag
+        
+        cos_alignment = torch.sum(goal_directions_norm * vel_directions_norm, dim=2)  # (num_drones, num_envs)
+        
+        is_moving = (vel_mag.squeeze(-1) > 0.1).float()
+        
+        k_align = 2.0
+        alignment_term = k_align * torch.clamp(cos_alignment, min=0.0) * is_moving  # (num_drones, num_envs)
+        
+        # ========================================
+        # 4. SMOOTHNESS TERM (Velocity Coupling Penalty)
+        # ========================================
+        lin_vel_mag = torch.linalg.norm(all_lin_vels, dim=2)  # (num_drones, num_envs)
+        ang_vel_mag = torch.linalg.norm(all_ang_vels, dim=2)  # (num_drones, num_envs)
+        
+        alpha = 0.3
+        beta = 0.5
+        gamma = 0.8
+        
+        smoothness_multiplier = 1.0 / (
+            1.0 + 
+            alpha * lin_vel_mag + 
+            beta * ang_vel_mag + 
+            gamma * lin_vel_mag * ang_vel_mag
+        )  # (num_drones, num_envs)
+        
+        # ========================================
+        # 5. OBSTACLE TERM (Continuous Repulsive Potential)
+        # ========================================
+        if self.curriculum_stage in [3, 5]:
+            obstacle_dists = self._cached_obstacle_dists  # (num_drones, num_envs)
+            
+            d_safe = 1.5
+            d_influence = 3.0
+            k_obs = 3.0
+            
+            influence = torch.clamp(
+                (d_influence - obstacle_dists) / (d_influence - d_safe), 
+                0.0, 
+                1.0
+            )
+            
+            obstacle_penalty = torch.exp(-k_obs * influence ** 2)  # (num_drones, num_envs)
+        else:
+            obstacle_penalty = torch.ones_like(position_energy)
+        
+        # ========================================
+        # 6. COOPERATION TERM (Laplace Potential)
+        # ========================================
+        if self.curriculum_stage in [4, 5]:
+            diff = all_positions.unsqueeze(1) - all_positions.unsqueeze(0)
+            pairwise_dists = torch.linalg.norm(diff, dim=3)
+            
+            eye_mask = torch.eye(self.num_drones, device=self.device).unsqueeze(2)
+            pairwise_dists = pairwise_dists + eye_mask * 1e6
+            
+            neighbor_dists = pairwise_dists.min(dim=1)[0]  # (num_drones, num_envs)
+            
+            d_opt = 1.75
+            k_coop = 2.0
+            
+            deviation = (neighbor_dists - d_opt) ** 2
+            coop_penalty = torch.exp(-k_coop * deviation)  # (num_drones, num_envs)
+        else:
+            coop_penalty = torch.ones_like(position_energy)
+        
+        # ========================================
+        # 7. RM STATE-AWARE WEIGHTING
+        # ========================================
+        rm_states = self._rm_states.transpose(0, 1)  # (num_drones, num_envs)
+        
+        w_position = torch.ones_like(position_energy)
+        w_delta = torch.ones_like(position_energy)
+        w_alignment = torch.ones_like(position_energy)
+        w_smoothness = torch.ones_like(position_energy)
+        
+        # RM STATE 0: HOVERING
+        is_hovering = (rm_states == 0).float()
+        w_position = torch.where(is_hovering.bool(), torch.full_like(w_position, 1.2), w_position)
+        w_delta = torch.where(is_hovering.bool(), torch.full_like(w_delta, 0.3), w_delta)
+        w_alignment = torch.where(is_hovering.bool(), torch.full_like(w_alignment, 0.0), w_alignment)
+        w_smoothness = torch.where(is_hovering.bool(), torch.full_like(w_smoothness, 1.5), w_smoothness)
+        
+        # RM STATE 1: SINGLE-MOVING
+        is_single = (rm_states == 1).float()
+        w_position = torch.where(is_single.bool(), torch.full_like(w_position, 0.8), w_position)
+        w_delta = torch.where(is_single.bool(), torch.full_like(w_delta, 1.5), w_delta)
+        w_alignment = torch.where(is_single.bool(), torch.full_like(w_alignment, 1.2), w_alignment)
+        w_smoothness = torch.where(is_single.bool(), torch.full_like(w_smoothness, 0.7), w_smoothness)
+        
+        # RM STATE 2: COOP-MOVING
+        is_coop = (rm_states == 2).float()
+        w_position = torch.where(is_coop.bool(), torch.full_like(w_position, 0.6), w_position)
+        w_delta = torch.where(is_coop.bool(), torch.full_like(w_delta, 1.0), w_delta)
+        w_alignment = torch.where(is_coop.bool(), torch.full_like(w_alignment, 0.8), w_alignment)
+        w_smoothness = torch.where(is_coop.bool(), torch.full_like(w_smoothness, 1.0), w_smoothness)
+        
+        # RM STATE 3: OBSTACLE-AVOIDING
+        is_avoiding = (rm_states == 3).float()
+        w_position = torch.where(is_avoiding.bool(), torch.full_like(w_position, 0.5), w_position)
+        w_delta = torch.where(is_avoiding.bool(), torch.full_like(w_delta, 0.5), w_delta)
+        w_alignment = torch.where(is_avoiding.bool(), torch.full_like(w_alignment, 0.3), w_alignment)
+        w_smoothness = torch.where(is_avoiding.bool(), torch.full_like(w_smoothness, 1.2), w_smoothness)
+        
+        # ========================================
+        # 8. COMBINED ENERGY REWARD (Hybrid Additive + Multiplicative)
+        # ========================================
+        base_energy = (
+            w_position * position_energy +
+            w_delta * delta_term +
+            w_alignment * alignment_term
+        )  # (num_drones, num_envs)
+        
+        combined_energy = (
+            base_energy * 
+            (w_smoothness * smoothness_multiplier) *
+            obstacle_penalty *
+            coop_penalty
+        )  # (num_drones, num_envs)
+        
+        scale = 0.15
+        bounded_reward = 2.0 * torch.tanh(scale * combined_energy)  # (num_drones, num_envs)
+        
+        # ========================================
+        # 9. AGGREGATE + SAFETY PENALTIES
+        # ========================================
+        mean_reward_per_env = bounded_reward.mean(dim=0)  # (num_envs,)
+        
+        # Collision penalty
+        agent_z = all_positions[:, :, 2]
+        too_low = agent_z < self.cfg.reward_cfg.min_flight_height
+        too_high = agent_z > self.cfg.reward_cfg.max_flight_height
+        collision = -(too_low | too_high).any(dim=0).float() * 10.0  # (num_envs,)
+        
+        # ✅ FIX: Jerk penalty with correct dimensions
+        if not hasattr(self, '_prev_actions'):
+            self._prev_actions = torch.zeros_like(self._actions)
+        
+        # self._actions: (num_envs, num_drones, 4)
+        # self._prev_actions: (num_envs, num_drones, 4)
+        action_diff = self._actions - self._prev_actions  # (num_envs, num_drones, 4)
+        
+        # Sum over action dimensions and drones, then scale
+        jerk_penalty = torch.sum(action_diff ** 2, dim=(1, 2)) * -0.01  # (num_envs,) ✅ FIXED
+        
+        self._prev_actions = self._actions.clone()
+        
+        # Small velocity penalties
+        lin_vel_penalty = lin_vel_mag.mean(dim=0) * -0.005  # (num_envs,)
+        ang_vel_penalty = ang_vel_mag.mean(dim=0) * -0.0025  # (num_envs,)
+        
+        # ✅ NOW ALL TERMS ARE (num_envs,) - no dimension mismatch!
+        reward = mean_reward_per_env + collision + jerk_penalty + lin_vel_penalty + ang_vel_penalty
+            
+        # ========================================
+        # 10. LOGGING (ONLY METRICS USED IN _reset_idx)
+        # ========================================
+        self._metrics.update(
+            distance_to_goal=distances.mean(dim=0),
+            lin_vel=lin_vel_penalty.abs(),
+            ang_vel=ang_vel_penalty.abs(),
+            collision=collision.abs(),
+            mean_reward=reward,
+        )
+        
+        return {f"robot_{i}": reward for i in range(self.num_drones)}
+                
+    def _get_rewards_old(self) -> dict[str, torch.Tensor]:
         """Smooth state-adaptive reward with continuous potential-based terms (uses cached data).
         
         Reward structure:
@@ -693,7 +910,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Terminate if any drone strays too far from environment origin
         died_out_of_bounds = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
-        env_origins = self._terrain.env_origins  # (num_envs, 3)
+        env_origins = self.scene.env_origins#self.scene.env_origins  # (num_envs, 3)
         max_distance_from_origin = self.cfg.reward_cfg.max_distance_from_origin  # e.g., 50.0m
         
         for rob in self._robots:
@@ -900,7 +1117,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                 for i in range(self.num_drones):
                     marker_cfg = SPHERE_MARKER_CFG.copy()
                     marker_cfg.markers["sphere"].radius = 0.05
-                    marker_cfg.markers["sphere"].visual_material.diffuse_color = (1.0, 1.0, 0.0)  # yellow
+                    marker_cfg.markers["sphere"].visual_material.diffuse_color = (0.0, 1.0, 0.0)  # green
                     marker_cfg.prim_path = f"/Visuals/Command/goal_position_{i}"
                     self.goal_pos_visualizers.append(VisualizationMarkers(marker_cfg))
             
@@ -928,7 +1145,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
                     for wp_idx in range(self.num_waypoints_per_agent):
                         marker_cfg = CUBOID_MARKER_CFG.copy()
                         marker_cfg.markers["cuboid"].size = (0.2, 0.2, 0.2)
-                        marker_cfg.markers["cuboid"].visual_material.diffuse_color = (0.0, 1.0, 0.0)  # green
+                        marker_cfg.markers["cuboid"].visual_material.diffuse_color = (0.0, 1.0, 0.0)  # yellow-green
                         marker_cfg.prim_path = f"/Visuals/Command/stage3_waypoint_agent{i}_wp{wp_idx}"
                         self.stage3_waypoint_visualizers.append(VisualizationMarkers(marker_cfg))
             
@@ -1513,7 +1730,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             perm = torch.randperm(self.num_drones, device=self.device)
             
             # Sample heights
-            start_heights = torch.zeros(self.num_drones, device=self.device).uniform_(0.3, 0.5)
+            start_heights = torch.zeros(self.num_drones, device=self.device).uniform_(0.6, 1.0)
             min_height = self.cfg.curriculum.goal_height_range[0]
             max_height = self.cfg.curriculum.goal_height_range[1]
             goal_heights = torch.zeros(self.num_drones, device=self.device).uniform_(min_height, max_height) 
