@@ -36,9 +36,7 @@ Agents learn to reach designated targets without environment disturbances.
 
 ### **Stage 3 — Navigation with Static Obstacles**
 Adds randomized cubic obstacles to develop obstacle-avoidance behavior.
-<p align="center">
-  <img src="assets/isaac-sim-env.png" width="80%" alt="Stage 3 Obstacle Environment">
-</p>
+
 
 ### **Stage 4 — Multi-Agent Formation Navigation**
 Multiple Crazyflies maintaining formation while navigating toward shared goals.
