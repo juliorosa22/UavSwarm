@@ -47,7 +47,7 @@ class UavSwarmEnvWindow(BaseEnvWindow):
 
 @configclass
 class CurriculumCfg:
-    active_stage: int = 2  # Current active stage (1 to 5)
+    active_stage: int = 1  # Current active stage (1 to 5)
     
 # ✅ NEW: Episode durations per stage
     stage1_episode_length_s: float = 30.0   # Hover
@@ -233,7 +233,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=256, env_spacing=10.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=128, env_spacing=5.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----

@@ -1,8 +1,8 @@
 # IsaacLab UAV Swarm Navigation
-
 <p align="center">
-  <img src="assets/swarm_progress.gif" width="80%" alt="UAV Swarm Hover Training Demo">
+  <img src="assets/isaac-sim-env.png" width="80%" alt="UAV Swarm Environment in Isaac Sim">
 </p>
+
 
 ## Overview
 
@@ -18,33 +18,39 @@ The final system will enable:
 
 ---
 
+
+
 ## Methodology
 
 The training process is divided into curriculum-based stages to ensure stable policy learning and reduce environment complexity:
 
-### **Stage 0 — Hovering**
+### **Stage 1 — Hovering**
 Basic stabilization in place using thrust + attitude control.
+<p align="center">
+  <img src="assets/swarm_progress.gif" width="80%" alt="UAV Swarm Hover Training Demo">
+</p>
 
-### **Stage 1 — Point-to-Point Navigation (no obstacles)**
+
+### **Stage 2 — Point-to-Point Navigation (no obstacles)**
 Agents learn to reach designated targets without environment disturbances.
 
-### **Stage 2 — Navigation with Static Obstacles**
+### **Stage 3 — Navigation with Static Obstacles**
 Adds randomized cubic obstacles to develop obstacle-avoidance behavior.
+<p align="center">
+  <img src="assets/isaac-sim-env.png" width="80%" alt="Stage 3 Obstacle Environment">
+</p>
 
-### **Stage 3 — Multi-Agent Navigation**
-Multiple Crazyflies operating simultaneously in the same environment.
+### **Stage 4 — Multi-Agent Formation Navigation**
+Multiple Crazyflies maintaining formation while navigating toward shared goals.
 
-### **Stage 4 — Inter-Agent Collision Avoidance**
-Penalty and termination for drone-drone collisions, promoting safe spacing.
-
-### **Stage 5 — Formation Learning (no obstacles)**
-Agents learn to maintain spatial structure (e.g., V-formation) during navigation.
+### **Stage 5 — Swarm Obstacle Navigation**
+Combined formation control + obstacle avoidance for cooperative swarm behavior.
 
 ---
 
 ## Demo
 
-The animation above shows multiple training phases (hovering → navigation → multi-agent behavior).  
+The animations above show the simulation environment with obstacles and the training progression.  
 For more videos and logs, check the `/assets` folder in this repository.
 
 ---

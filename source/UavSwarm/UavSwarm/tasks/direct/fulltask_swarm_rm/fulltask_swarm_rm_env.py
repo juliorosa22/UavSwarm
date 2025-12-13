@@ -488,6 +488,88 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         
         return state
 
+
+    def _base_reward(self) -> torch.Tensor:
+        """Simple distance-based reward adapted from copy_quadenv.py for multi-agent use.
+        
+        Computes individual rewards for each agent using the proven simple formula:
+        - Distance term: Main objective (exponentially decaying with tanh mapping)
+        - Velocity penalties: Encourage smooth, stable flight
+        
+        Returns:
+            Per-environment reward (mean across all agents), shape (num_envs,)
+        """
+        # Stack all robot data: (num_drones, num_envs, 3)
+        all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
+        all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
+        all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
+        
+        desired_transposed = self._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+        
+        # ========================================
+        # 1. DISTANCE TERM (per agent)
+        # ========================================
+        # Euclidean distance to goal
+        distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
+        
+        # Map distance to [0, 1] using tanh (same as copy_quadenv.py)
+        distance_mapped = 1.0 - torch.tanh(distances / 0.8)  # (num_drones, num_envs)
+        
+        # Scale by reward weight
+        distance_reward = distance_mapped * 15.0  # (num_drones, num_envs)
+        
+        # ========================================
+        # 2. VELOCITY PENALTIES (per agent)
+        # ========================================
+        # Linear velocity penalty (encourage hovering when at goal)
+        lin_vel_squared = torch.sum(all_lin_vels ** 2, dim=2)  # (num_drones, num_envs)
+        lin_vel_penalty = lin_vel_squared * -0.05  # (num_drones, num_envs)
+        
+        # Angular velocity penalty (encourage stable orientation)
+        ang_vel_squared = torch.sum(all_ang_vels ** 2, dim=2)  # (num_drones, num_envs)
+        ang_vel_penalty = ang_vel_squared * -0.01  # (num_drones, num_envs)
+        
+        # ========================================
+        # 3. COMBINE PER-AGENT REWARDS
+        # ========================================
+        # Sum components for each agent
+        per_agent_reward = distance_reward + lin_vel_penalty + ang_vel_penalty  # (num_drones, num_envs)
+        
+        # ========================================
+        # 4. AGGREGATE TO GLOBAL REWARD
+        # ========================================
+        # Mean across all agents to get environment-level reward
+        global_reward = per_agent_reward.mean(dim=0)  # (num_envs,)
+        
+        # ========================================
+        # 5. SAFETY PENALTIES (environment-level)
+        # ========================================
+        # Collision penalty (any agent out of bounds)
+        agent_z = all_positions[:, :, 2]  # (num_drones, num_envs)
+        too_low = agent_z < self.cfg.reward_cfg.min_flight_height
+        too_high = agent_z > self.cfg.reward_cfg.max_flight_height
+        collision = -(too_low | too_high).any(dim=0).float() * 10.0  # (num_envs,)
+        
+        # ========================================
+        # 6. FINAL REWARD
+        # ========================================
+        reward = global_reward + collision  # (num_envs,)
+        
+        # ========================================
+        # 7. LOGGING (OPTIONAL)
+        # ========================================
+        self._metrics.update(
+            distance_to_goal=distances.mean(dim=0),  # Mean distance across agents
+            lin_vel=lin_vel_penalty.abs().mean(dim=0),  # Mean linear velocity penalty
+            ang_vel=ang_vel_penalty.abs().mean(dim=0),  # Mean angular velocity penalty
+            collision=collision.abs(),
+            mean_reward=reward,
+        )
+        
+        return reward  # (num_envs,)
+
+
+
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         """Energy-based reward with distance delta, velocity alignment, and RM state shaping."""
         
@@ -507,7 +589,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # ========================================
         distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
         
-        k_pos = 10.0
+        k_pos = 20.0
         position_energy = k_pos / (1.0 + distances ** 2)  # (num_drones, num_envs)
         
         # ========================================

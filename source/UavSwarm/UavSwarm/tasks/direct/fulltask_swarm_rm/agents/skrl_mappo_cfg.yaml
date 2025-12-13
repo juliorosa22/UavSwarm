@@ -68,15 +68,15 @@ agent:
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "hover_improved_rw_v1"  # ✅ Updated directory name for curriculum learning
+    directory: "hover_improved_rw_v1_checkpoint1"  # ✅ Updated directory name for curriculum learning
     experiment_name: ""
-    write_interval: 1000  # ✅ Changed from auto - log every 500 steps
-    checkpoint_interval: 5000  # ✅ Changed from auto - save every 5000 steps
+    write_interval: 5000  # ✅ Changed from auto - log every 500 steps
+    checkpoint_interval: 20000  # ✅ Changed from auto - save every 5000 steps
 
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 100000  # ✅ Increased from 30000 - curriculum learning needs more time
+  timesteps: 500000  # ✅ Increased from 30000 - curriculum learning needs more time
   environment_info: log
