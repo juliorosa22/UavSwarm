@@ -1,5 +1,5 @@
 train hover:
-python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --algorithm MAPPO  --video --video_length 1000 --video_interval 1000 --enable_cameras
+python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --ml_framework torch --algorithm MAPPO  --video --video_length 1000 --video_interval 1000 --enable_cameras
 
 play:
-python scripts/skrl/play.py --task=FullTask-UAVSwarm-Direct-v0 --algorithm MAPPO --num_envs 32 --checkpoint logs/skrl/hover_stage_mappo_v2/2025-12-08_20-16-07_mappo_torch/checkpoints/agent_30000.pt
+python scripts/skrl/play.py --task=FullTask-UAVSwarm-Direct-v0 --ml_framework torch --algorithm MAPPO --num_envs 32 --checkpoint logs/skrl/hover_stage_mappo_v2/2025-12-08_20-16-07_mappo_torch/checkpoints/agent_30000.pt

@@ -65,6 +65,9 @@ def main():
     # reset environment
     env.reset()
     
+    # ✅ NEW: Step counter
+    timestep = 0
+    
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
@@ -79,12 +82,25 @@ def main():
                     agent: torch.zeros(num_envs, action_dim, device=env.unwrapped.device)
                     for agent in env.unwrapped.cfg.possible_agents
                 }
+                print(f"[DEBUG]: Actions dict keys: {list(actions.keys())}")
+                print(f"actions:{actions}")
             else:
                 # For standard RL: actions shape from action_space
                 actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
             
             # apply actions
-            env.step(actions)
+            obs, _, _, _, _ = env.step(actions)
+            
+            # ✅ NEW: Print observations every 100 steps
+            if timestep % 100 == 0:
+                print(f"\n[Step {timestep}] Observations:")
+                if isinstance(obs, dict):
+                    for agent_name, agent_obs in obs.items():
+                        print(f"  {agent_name}: shape={agent_obs.shape}, mean={agent_obs.mean().item():.4f}")
+                else:
+                    print(f"  shape={obs.shape}, mean={obs.mean().item():.4f}")
+            
+            timestep += 1
 
     # close the simulator
     env.close()

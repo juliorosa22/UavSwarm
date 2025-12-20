@@ -197,7 +197,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    
+    num_agents_correct = env.unwrapped.num_agents
     # Debug: Print environment info BEFORE wrapping
     print("\n[DEBUG] Environment info before wrapping:")
     print(f"Environment type: {type(env.unwrapped)}")
@@ -250,7 +250,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
-    
+    #env.num_agents = num_agents_correct  # Preserve correct num_agents after wrapping
     # Debug: Verify wrapper preserved multi-agent info
     print("\n[DEBUG] Environment info after SkrlVecEnvWrapper:")
     print(f"Wrapped env type: {type(env)}")

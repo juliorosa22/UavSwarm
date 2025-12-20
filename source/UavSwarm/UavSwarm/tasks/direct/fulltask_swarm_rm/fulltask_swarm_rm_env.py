@@ -68,7 +68,12 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         cfg.episode_length_s = cfg.curriculum.get_episode_length()
         print(f"[INFO] Stage {cfg.curriculum.active_stage}: Episode length = {cfg.episode_length_s}s")
         # Initialize lists (before parent __init__)
-
+        #self._num_agents_value = cfg.num_agents
+        # ✅ CRITICAL: Initialize internal storage BEFORE parent init
+        # self._num_agents_value = cfg.num_agents
+        # self._agents_list = cfg.possible_agents.copy()
+        # self._possible_agents_list = cfg.possible_agents.copy()
+        
 
         self._robots = []
         self._body_ids = []
@@ -167,6 +172,65 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
 
         # Debug visualization
         self.set_debug_vis(self.cfg.debug_vis)
+
+    # @property
+    # def num_agents(self) -> int:
+    #     """Return the number of agents in the environment.
+        
+    #     This overrides any parent implementation that might return dynamic count.
+    #     Always returns the configured number of agents.
+        
+    #     Returns:
+    #         Number of agents (drones) in the environment.
+    #     """
+    #     # Return stored value (set before parent __init__)
+    #     if hasattr(self, '_num_agents_value'):
+    #         return self._num_agents_value
+    #     # Fallback to config
+    #     if hasattr(self, 'cfg'):
+    #         return self.cfg.num_agents
+    #     # Hard-coded fallback
+    #     return 5
+    
+    # @num_agents.setter
+    # def num_agents(self, value: int):
+    #     """Allow parent class to set num_agents during initialization."""
+    #     self._num_agents_value = value
+
+
+    # @property
+    # def agents(self) -> list[str]:
+    #     """Return list of active agent IDs.
+        
+    #     Returns:
+    #         List of currently active agent identifiers.
+    #     """
+    #     if hasattr(self, 'cfg'):
+    #         return self.cfg.possible_agents
+    #     return [f"robot_{i}" for i in range(self.num_agents)]
+    
+    # @agents.setter
+    # def agents(self, value: list[str]):
+    #     """Allow parent class to set agents during initialization."""
+    #     self._agents_list = value
+
+
+    # @property
+    # def possible_agents(self) -> list[str]:
+    #     """Return list of all possible agent IDs.
+        
+    #     Returns:
+    #         List of all possible agent identifiers.
+    #     """
+    #     if hasattr(self, 'cfg'):
+    #         return self.cfg.possible_agents
+    #     return [f"robot_{i}" for i in range(self.num_agents)]
+
+    # @possible_agents.setter
+    # def possible_agents(self, value: list[str]):
+    #     """Allow parent class to set possible_agents during initialization."""
+    #     self._possible_agents_list = value
+
 
     ## MAIN ENVIRONMENT FUNCTIONS ##
 
@@ -379,10 +443,18 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self._set_stage5_positions(env_ids, env_origins)
 
     def _get_observations(self) -> dict:
-        """Fully vectorized observation generation using cached data."""
+        """Generate observations for shared policy MAPPO with centralized critic.
         
-        # ✅ SAFETY CHECK: Cache should already be populated
-            # ✅ LAZY CACHE POPULATION: Populate if not valid (handles reset case)
+        Returns:
+            Dictionary with two keys:
+            - 'policy': Dict of per-agent observations for the actor {agent_name: obs}
+            - 'critic': Dict of centralized states for the critic {agent_name: state}
+            
+            For shared policy:
+            - Policy gets individual observations: (num_envs, obs_dim=23)
+            - Critic gets concatenated observations from all agents: (num_envs, state_dim=num_agents*23)
+        """
+        
         # ✅ POPULATE CACHE IF NEEDED (after physics simulation)
         self._ensure_cache_populated()
         
@@ -410,24 +482,27 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             num_classes=self.cfg.reward_cfg.num_rm_states
         ).float()  # (num_drones, num_envs, 4)
         
-        # ✅ USE CACHED VALUES (already computed in _apply_action)
+        # ✅ CONSTRUCT PER-AGENT OBSERVATIONS
+        # Shape: (num_drones, num_envs, 23)
         all_obs = torch.cat([
             all_lin_vels,                                    # (num_drones, num_envs, 3)
             all_ang_vels,                                    # (num_drones, num_envs, 3)
             all_gravities,                                   # (num_drones, num_envs, 3)
             desired_pos_b,                                   # (num_drones, num_envs, 3)
-            self._cached_obstacle_dists.unsqueeze(-1),      # (num_drones, num_envs, 1) ✅ CACHED
-            self._cached_neighbor_rel_vel_b,                # (num_drones, num_envs, 3) ✅ CACHED
-            self._cached_neighbor_rel_pos_b,                # (num_drones, num_envs, 3) ✅ CACHED
+            self._cached_obstacle_dists.unsqueeze(-1),      # (num_drones, num_envs, 1)
+            self._cached_neighbor_rel_vel_b,                # (num_drones, num_envs, 3)
+            self._cached_neighbor_rel_pos_b,                # (num_drones, num_envs, 3)
             rm_state_onehot,                                 # (num_drones, num_envs, 4)
         ], dim=-1)  # (num_drones, num_envs, 23)
         
-        # Convert to dictionary format
-        obs_dict = {}
+        # ✅ CREATE POLICY OBSERVATIONS (per-agent)
+        observations = {}
         for j in range(self.num_drones):
-            obs_dict[f"robot_{j}"] = all_obs[j]  # (num_envs, 23)
+            observations[f"robot_{j}"] = all_obs[j]  # (num_envs, 23)
         
-        return obs_dict
+        # ✅ RETURN SIMPLE DICTIONARY (no nested 'policy'/'critic' keys)
+        # With separate: True, both policy and critic use the same observations
+        return observations
         
     def _get_states(self) -> torch.Tensor:
         """Get centralized state for MAPPO critic (reuses cached computations).

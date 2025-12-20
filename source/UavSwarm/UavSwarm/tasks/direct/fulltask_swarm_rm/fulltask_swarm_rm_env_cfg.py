@@ -211,6 +211,8 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     possible_agents = [f"robot_{i}" for i in range(num_agents)]
     action_spaces = {f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)}
     observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(23,)) for i in range(num_agents)}
+   
+    
     # ----- UI -----
     debug_vis = True
     ui_window_class_type = UavSwarmEnvWindow
@@ -233,7 +235,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     # ----- Scene -----
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=128, env_spacing=5.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=256, env_spacing=8.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # ----- Robot Template (will be instantiated N times) -----

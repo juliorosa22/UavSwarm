@@ -4,7 +4,7 @@ seed: 42
 # Models are instantiated using skrl's model instantiator utility
 # https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
 models:
-  separate: True
+  separate: True  # ✅ Important for MARL - separate models per agent
   policy:  # see gaussian_model parameters
     class: GaussianMixin
     clip_actions: True  # ✅ Changed to True - prevents extreme actions
@@ -13,7 +13,7 @@ models:
     max_log_std: 2.0
     initial_log_std: 0.0  # ✅ Start with moderate exploration
     network:
-      - name: net
+      - name: policy_net
         input: OBSERVATIONS
         layers: [128, 128]  # ✅ Deeper network for complex RM state reasoning
         activations: relu
@@ -22,8 +22,8 @@ models:
     class: DeterministicMixin
     clip_actions: False
     network:
-      - name: net
-        input: OBSERVATIONS
+      - name: critic_net
+        input: OBSERVATIONS  # ✅ Use global state for value function
         layers: [128, 128, 128]  # ✅ Match policy network depth
         activations: relu
     output: ONE
@@ -68,15 +68,15 @@ agent:
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "hover_improved_rw_v1_checkpoint1"  # ✅ Updated directory name for curriculum learning
+    directory: "stage1_model"  # ✅ Updated directory name for curriculum learning
     experiment_name: ""
-    write_interval: 5000  # ✅ Changed from auto - log every 500 steps
-    checkpoint_interval: 20000  # ✅ Changed from auto - save every 5000 steps
+    write_interval: 200 #5000  # ✅ Changed from auto - log every 500 steps
+    checkpoint_interval: 200  # ✅ Changed from auto - save every 5000 steps
 
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 500000  # ✅ Increased from 30000 - curriculum learning needs more time
+  timesteps: 20000  # ✅ Increased from 30000 - curriculum learning needs more time
   environment_info: log
