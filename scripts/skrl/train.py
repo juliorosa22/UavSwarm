@@ -82,7 +82,7 @@ from datetime import datetime
 
 import skrl
 from packaging import version
-
+import torch
 # check for minimum supported skrl version
 SKRL_VERSION = "1.4.3"
 if version.parse(skrl.__version__) < version.parse(SKRL_VERSION):
@@ -125,6 +125,238 @@ if args_cli.agent is None:
 else:
     agent_cfg_entry_point = args_cli.agent
     algorithm = agent_cfg_entry_point.split("_cfg")[0].split("skrl_")[-1].lower()
+
+
+def inspect_checkpoint(agent, checkpoint_path):
+    """Inspect checkpoint for NaN values and print statistics."""
+    print("\n" + "="*80)
+    print("CHECKPOINT INSPECTION")
+    print("="*80)
+    print(f"Checkpoint: {checkpoint_path}")
+    
+    # ✅ Handle different agent types (PPO, IPPO, MAPPO)
+    policy_has_nan = False
+    value_has_nan = False
+    
+    # Get policy network (depends on agent type)
+    if hasattr(agent, 'policy'):
+        # Single-agent PPO
+        policy_nets = {'main': agent.policy}
+        value_nets = {'main': agent.value} if hasattr(agent, 'value') else {}
+    elif hasattr(agent, 'policies'):
+        # MAPPO (uses policies/values dicts per agent)
+        policy_nets = agent.policies
+        value_nets = agent.values if hasattr(agent, 'values') else {}
+    elif hasattr(agent, 'models') and 'policy' in agent.models:
+        # IPPO (uses models dict)
+        policy_nets = {'main': agent.models['policy']}
+        value_nets = {'main': agent.models.get('value', None)}
+    else:
+        print("  ⚠️  Could not find policy network in agent")
+        print(f"  Agent type: {type(agent).__name__}")
+        return False
+    
+    # Check policy networks
+    print("\n[Policy Networks]")
+    for agent_id, policy_net in policy_nets.items():
+        print(f"\nAgent: {agent_id}")
+        for name, param in policy_net.named_parameters():
+            if torch.isnan(param).any():
+                print(f"  ⚠️  NaN detected in {name}")
+                policy_has_nan = True
+            else:
+                print(f"  ✅ {name}: mean={param.mean().item():.6f}, std={param.std().item():.6f}, min={param.min().item():.6f}, max={param.max().item():.6f}")
+    
+    # Check value networks
+    if value_nets:
+        print("\n[Value Networks]")
+        for agent_id, value_net in value_nets.items():
+            if value_net is not None:
+                print(f"\nAgent: {agent_id}")
+                for name, param in value_net.named_parameters():
+                    if torch.isnan(param).any():
+                        print(f"  ⚠️  NaN detected in {name}")
+                        value_has_nan = True
+                    else:
+                        print(f"  ✅ {name}: mean={param.mean().item():.6f}, std={param.std().item():.6f}")
+    
+    # Check optimizer state
+    print("\n[Optimizer State]")
+    
+    # Handle different optimizer structures
+    if hasattr(agent, 'optimizer'):
+        # Single optimizer
+        optimizers = [('main', agent.optimizer)]
+    elif hasattr(agent, 'optimizers'):
+        # Multiple optimizers (MAPPO)
+        if isinstance(agent.optimizers, dict):
+            optimizers = list(agent.optimizers.items())
+        else:
+            optimizers = [('main', agent.optimizers)]
+    else:
+        optimizers = []
+        print("  ⚠️  No optimizer found")
+    
+    for opt_name, optimizer in optimizers:
+        print(f"\n  Optimizer '{opt_name}':")
+        for i, param_group in enumerate(optimizer.param_groups):
+            print(f"    Param group {i}:")
+            print(f"      Learning rate: {param_group['lr']}")
+            if 'momentum' in param_group:
+                print(f"      Momentum: {param_group['momentum']}")
+        
+        # Check if optimizer has state (momentum, adaptive rates)
+        if optimizer.state:
+            print(f"    Optimizer has state for {len(optimizer.state)} parameters")
+        else:
+            print("    ⚠️  Optimizer state is empty (freshly initialized)")
+    
+    print("\n" + "="*80)
+    
+    return policy_has_nan or value_has_nan
+
+
+def add_nan_detection_hooks(agent):
+    """Add forward hooks to detect NaN in network outputs."""
+    #import torch
+    
+    def nan_hook(module, input, output):
+        if not isinstance(output, tuple):
+            outputs = [output]
+        else:
+            outputs = output
+        
+        for i, out in enumerate(outputs):
+            if isinstance(out, torch.Tensor):
+                nan_mask = torch.isnan(out)
+                if nan_mask.any():
+                    print(f"\n⚠️  NaN DETECTED in {module.__class__.__name__}")
+                    print(f"   Output {i}: {nan_mask.sum().item()} NaN values out of {out.numel()}")
+    
+    # ✅ Handle different agent types
+    if hasattr(agent, 'policy'):
+        # Single-agent PPO
+        policy_nets = {'main': agent.policy}
+        value_nets = {'main': agent.value} if hasattr(agent, 'value') else {}
+    elif hasattr(agent, 'policies'):
+        # MAPPO (uses policies/values dicts per agent)
+        policy_nets = agent.policies
+        value_nets = agent.values if hasattr(agent, 'values') else {}
+    elif hasattr(agent, 'models') and 'policy' in agent.models:
+        # IPPO (uses models dict)
+        policy_nets = {'main': agent.models['policy']}
+        value_nets = {'main': agent.models.get('value', None)}
+    else:
+        print(f"  ⚠️  Could not find networks to add hooks (agent type: {type(agent).__name__})")
+        return
+    
+    # Register hooks on policy networks
+    hooks_registered = 0
+    for agent_id, policy_net in policy_nets.items():
+        if policy_net is not None:
+            for module in policy_net.modules():
+                module.register_forward_hook(nan_hook)
+            hooks_registered += 1
+    
+    # Register hooks on value networks
+    for agent_id, value_net in value_nets.items():
+        if value_net is not None:
+            for module in value_net.modules():
+                module.register_forward_hook(nan_hook)
+            hooks_registered += 1
+    
+    print(f"[INFO] NaN detection hooks registered on {hooks_registered} networks")
+
+
+def reset_agent_for_new_stage(agent, checkpoint_path):
+    """
+    Reset agent optimizer and policy parameters for curriculum learning stage.
+    
+    Args:
+        agent: The skrl agent (PPO, IPPO, or MAPPO)
+        checkpoint_path: Path to the loaded checkpoint (for logging)
+    
+    Returns:
+        bool: True if checkpoint contains NaN values
+    """
+    import torch
+    
+    print("\n" + "="*80)
+    print("RESETTING AGENT FOR NEW TRAINING STAGE")
+    print("="*80)
+    
+    # Reset optimizer state for fresh training stage
+    print("[INFO] Resetting optimizer state...")
+    
+    # Arguments that should NOT be passed to optimizer constructor
+    OPTIMIZER_NON_CONSTRUCTOR_ARGS = {
+        'params', 'differentiable', 'initial_lr', 'capturable', 
+        'foreach', 'fused', 'maximize'
+    }
+    
+    if hasattr(agent, 'optimizer'):
+        # Single optimizer (PPO)
+        opt_class = agent.optimizer.__class__
+        opt_config = agent.optimizer.param_groups[0].copy()
+        params = [p for group in agent.optimizer.param_groups for p in group['params']]
+        
+        # Remove non-constructor args
+        for key in OPTIMIZER_NON_CONSTRUCTOR_ARGS:
+            opt_config.pop(key, None)
+        
+        # Create fresh optimizer
+        agent.optimizer = opt_class(params, **opt_config)
+        print("  ✅ Reset single optimizer state")
+        
+    elif hasattr(agent, 'optimizers'):
+        # Multiple optimizers (MAPPO/IPPO)
+        if isinstance(agent.optimizers, dict):
+            for name, optimizer in agent.optimizers.items():
+                opt_class = optimizer.__class__
+                opt_config = optimizer.param_groups[0].copy()
+                params = [p for group in optimizer.param_groups for p in group['params']]
+                
+                # Remove non-constructor args
+                for key in OPTIMIZER_NON_CONSTRUCTOR_ARGS:
+                    opt_config.pop(key, None)
+                
+                # Create fresh optimizer
+                agent.optimizers[name] = opt_class(params, **opt_config)
+                print(f"  ✅ Reset optimizer '{name}' state")
+        else:
+            opt_class = agent.optimizers.__class__
+            opt_config = agent.optimizers.param_groups[0].copy()
+            params = [p for group in agent.optimizers.param_groups for p in group['params']]
+            
+            for key in OPTIMIZER_NON_CONSTRUCTOR_ARGS:
+                opt_config.pop(key, None)
+            
+            agent.optimizers = opt_class(params, **opt_config)
+            print("  ✅ Reset optimizer state")
+    
+    # Reset log_std to initial value for exploration
+    # Handle different agent structures
+    if hasattr(agent, 'policies'):
+        # MAPPO (per-agent policies)
+        for agent_id, policy in agent.policies.items():
+            if hasattr(policy, 'log_std'):
+                policy.log_std.data.fill_(0.0)
+        print("  ✅ Reset policy log_std to 0.0 for all agents")
+    elif hasattr(agent, 'models') and 'policy' in agent.models:
+        # IPPO
+        agent.models["policy"].log_std.data.fill_(0.0)
+        print("  ✅ Reset policy log_std to 0.0")
+    elif hasattr(agent, 'policy') and hasattr(agent.policy, 'log_std'):
+        # PPO
+        agent.policy.log_std.data.fill_(0.0)
+        print("  ✅ Reset policy log_std to 0.0")
+    
+    # Inspect checkpoint for NaN values
+    has_nan = inspect_checkpoint(agent, checkpoint_path)
+    
+    print("="*80 + "\n")
+    
+    return has_nan
 
 
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
@@ -198,6 +430,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     num_agents_correct = env.unwrapped.num_agents
+    
     # Debug: Print environment info BEFORE wrapping
     print("\n[DEBUG] Environment info before wrapping:")
     print(f"Environment type: {type(env.unwrapped)}")
@@ -250,7 +483,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)
-    #env.num_agents = num_agents_correct  # Preserve correct num_agents after wrapping
+    
     # Debug: Verify wrapper preserved multi-agent info
     print("\n[DEBUG] Environment info after SkrlVecEnvWrapper:")
     print(f"Wrapped env type: {type(env)}")
@@ -272,11 +505,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
     runner = Runner(env, agent_cfg)
+    
+    # ✅ ADD NaN DETECTION HOOKS (works for all agent types now)
+    print(f"\n[DEBUG] Agent type: {type(runner.agent).__name__}")
+    print(f"[DEBUG] Agent attributes: {[attr for attr in dir(runner.agent) if not attr.startswith('_')][:10]}")
+    add_nan_detection_hooks(runner.agent)
 
     # load checkpoint (if specified)
     if resume_path:
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
+        
+        # Reset agent for new training stage
+        has_nan = reset_agent_for_new_stage(runner.agent, resume_path)
+        
+        if has_nan:
+            print("\n❌ ERROR: Checkpoint contains NaN values!")
+            env.close()
+            simulation_app.close()
+            sys.exit(1)
 
     # run training
     runner.run()

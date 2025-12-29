@@ -1,5 +1,22 @@
 train hover:
-python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --ml_framework torch --algorithm MAPPO  --video --video_length 1000 --video_interval 1000 --enable_cameras
+python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --ml_framework torch --algorithm MAPPO  --video --video_length 1000 --video_interval 50000 --enable_cameras
+
+python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --ml_framework torch --algorithm MAPPO 
+
+python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --ml_framework torch --algorithm MAPPO --video --video_length 1000 --video_interval 1000 --enable_cameras
 
 play:
+
 python scripts/skrl/play.py --task=FullTask-UAVSwarm-Direct-v0 --ml_framework torch --algorithm MAPPO --num_envs 32 --checkpoint logs/skrl/hover_stage_mappo_v2/2025-12-08_20-16-07_mappo_torch/checkpoints/agent_30000.pt
+
+eval:
+python scripts/skrl/eval_models.py --task=FullTask-UAVSwarm-Direct-v0 --ml_framework torch --algorithm MAPPO --checkpoint logs/skrl/new_stage5_model/2025-12-24_21-08-26_mappo_torch/checkpoints/agent_1000000.pt
+
+python scripts/skrl/play.py --task=FullTask-UAVSwarm-Direct-v0 --checkpoint logs/skrl/stage4_model/2025-12-21_13-58-31_mappo_torch/checkpoints/agent_30000.pt --eval_agent_id robot_2 --algorithm MAPPO  --num_envs 1
+#train baseline
+
+Baseline-UAVSwarm-Direct-v0
+python scripts/skrl/train.py --task=Baseline-UAVSwarm-Direct-v0 --headless --ml_framework torch --algorithm MAPPO --video --video_length 1000 --video_interval 1000 --enable_cameras
+
+##continue stage 5:
+python scripts/skrl/train.py --task=FullTask-UAVSwarm-Direct-v0 --headless --checkpoint logs/skrl/new_stage5_model_continue/2025-12-27_14-40-51_mappo_torch/checkpoints/agent_630000.pt --ml_framework torch --algorithm MAPPO --video --video_length 1000 --video_interval 1000 --enable_cameras

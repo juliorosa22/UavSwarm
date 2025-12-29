@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import torch
 from isaaclab.utils.math import subtract_frame_transforms
-from .fulltask_swarm_rm_env_cfg import FullTaskUAVSwarmEnvCfg
+from .baseline_uavswarm_env_cfg import BaselineUAVSwarmEnvCfg
 from isaaclab.markers import SPHERE_MARKER_CFG  # isort: skip
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
@@ -46,8 +46,9 @@ Main idea of how use the Direct workflow when designing a task
 
 """
 
-#TODO Remove all the usage of ray_caster. after some on NVIDIA Isaac Sim team confirmed that the ray caster sensor is not working properly with multiple obstacles yet and MARL envs.
-class FullTaskUAVSwarmEnv(DirectMARLEnv):
+#TODO ADJUST THIS CLASS TO unplug RM states from observations for the baseline
+
+class BaselineUAVSwarmEnv(DirectMARLEnv):
     """
     Direct-style MARL environment with N Crazyflies per env.
     - Actions: per-drone [thrust, mx, my, mz] ⇒ shape (num_agents, 4)
@@ -55,9 +56,9 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
     - Rewards: per-drone terms + swarm cohesion/collision penalties
     """
 
-    cfg: FullTaskUAVSwarmEnvCfg
+    cfg: BaselineUAVSwarmEnvCfg
 
-    def __init__(self, cfg: FullTaskUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: BaselineUAVSwarmEnvCfg, render_mode: str | None = None, **kwargs):
         
         self.num_drones = cfg.num_agents        
         self.global_step=0
@@ -79,7 +80,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         self._body_ids = []
         self._obstacle_positions=None
         super().__init__(cfg, render_mode, **kwargs)
-        
+        print(f"[INFO] SuperClass var Episode length: {self.max_episode_length_s}s = {self.max_episode_length} steps")
         # Now device is available, initialize tensors
         self._actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         self._thrust = torch.zeros(self.num_envs, self.num_drones, 1, 3, device=self.device)
@@ -173,64 +174,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         # Debug visualization
         self.set_debug_vis(self.cfg.debug_vis)
 
-    # @property
-    # def num_agents(self) -> int:
-    #     """Return the number of agents in the environment.
-        
-    #     This overrides any parent implementation that might return dynamic count.
-    #     Always returns the configured number of agents.
-        
-    #     Returns:
-    #         Number of agents (drones) in the environment.
-    #     """
-    #     # Return stored value (set before parent __init__)
-    #     if hasattr(self, '_num_agents_value'):
-    #         return self._num_agents_value
-    #     # Fallback to config
-    #     if hasattr(self, 'cfg'):
-    #         return self.cfg.num_agents
-    #     # Hard-coded fallback
-    #     return 5
     
-    # @num_agents.setter
-    # def num_agents(self, value: int):
-    #     """Allow parent class to set num_agents during initialization."""
-    #     self._num_agents_value = value
-
-
-    # @property
-    # def agents(self) -> list[str]:
-    #     """Return list of active agent IDs.
-        
-    #     Returns:
-    #         List of currently active agent identifiers.
-    #     """
-    #     if hasattr(self, 'cfg'):
-    #         return self.cfg.possible_agents
-    #     return [f"robot_{i}" for i in range(self.num_agents)]
-    
-    # @agents.setter
-    # def agents(self, value: list[str]):
-    #     """Allow parent class to set agents during initialization."""
-    #     self._agents_list = value
-
-
-    # @property
-    # def possible_agents(self) -> list[str]:
-    #     """Return list of all possible agent IDs.
-        
-    #     Returns:
-    #         List of all possible agent identifiers.
-    #     """
-    #     if hasattr(self, 'cfg'):
-    #         return self.cfg.possible_agents
-    #     return [f"robot_{i}" for i in range(self.num_agents)]
-
-    # @possible_agents.setter
-    # def possible_agents(self, value: list[str]):
-    #     """Allow parent class to set possible_agents during initialization."""
-    #     self._possible_agents_list = value
-
 
     ## MAIN ENVIRONMENT FUNCTIONS ##
 
@@ -362,6 +306,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
 
         # ✅ ADD DETAILED TERMINATION REASONS (if available)
         if hasattr(self, '_termination_reasons'):
+            #print("episode termination reasons logged")
             log_dict["Episode_Termination/collision"] = torch.count_nonzero(
                 self._termination_reasons['collision'][env_ids]
             ).item()
@@ -474,13 +419,13 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             desired_pos_w_transposed.reshape(-1, 3)
         )
         desired_pos_b = desired_pos_b.reshape(self.num_drones, self.num_envs, 3)
-        
+        #RM deactivated for baseline
         # RM state one-hot encoding (vectorized)
-        rm_states_transposed = self._rm_states.transpose(0, 1)  # (num_drones, num_envs)
-        rm_state_onehot = torch.nn.functional.one_hot(
-            rm_states_transposed, 
-            num_classes=self.cfg.reward_cfg.num_rm_states
-        ).float()  # (num_drones, num_envs, 4)
+        # rm_states_transposed = self._rm_states.transpose(0, 1)  # (num_drones, num_envs)
+        # rm_state_onehot = torch.nn.functional.one_hot(
+        #     rm_states_transposed, 
+        #     num_classes=self.cfg.reward_cfg.num_rm_states
+        # ).float()  # (num_drones, num_envs, 4)
         
         # ✅ CONSTRUCT PER-AGENT OBSERVATIONS
         # Shape: (num_drones, num_envs, 23)
@@ -492,7 +437,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self._cached_obstacle_dists.unsqueeze(-1),      # (num_drones, num_envs, 1)
             self._cached_neighbor_rel_vel_b,                # (num_drones, num_envs, 3)
             self._cached_neighbor_rel_pos_b,                # (num_drones, num_envs, 3)
-            rm_state_onehot,                                 # (num_drones, num_envs, 4)
+            #rm_state_onehot,                                 # (num_drones, num_envs, 4)
         ], dim=-1)  # (num_drones, num_envs, 23)
         
         # ✅ CREATE POLICY OBSERVATIONS (per-agent)
@@ -552,11 +497,11 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
         desired_pos_b = desired_pos_b.reshape(self.num_drones, self.num_envs, 3)
         
         # RM state one-hot encoding
-        rm_states_transposed = self._rm_states.transpose(0, 1)
-        rm_state_onehot = torch.nn.functional.one_hot(
-            rm_states_transposed, 
-            num_classes=self.cfg.reward_cfg.num_rm_states
-        ).float()
+        #rm_states_transposed = self._rm_states.transpose(0, 1)
+        #rm_state_onehot = torch.nn.functional.one_hot(
+        #    rm_states_transposed, 
+        #    num_classes=self.cfg.reward_cfg.num_rm_states
+        #).float()
         
         # ✅ USE CACHED VALUES (no recomputation!)
         all_obs = torch.cat([
@@ -567,7 +512,7 @@ class FullTaskUAVSwarmEnv(DirectMARLEnv):
             self._cached_obstacle_dists.unsqueeze(-1),      # ✅ CACHED
             self._cached_neighbor_rel_vel_b,                # ✅ CACHED
             self._cached_neighbor_rel_pos_b,                # ✅ CACHED
-            rm_state_onehot,
+            #rm_state_onehot,
         ], dim=-1)
         
         # Transpose to (num_envs, num_drones, 23)

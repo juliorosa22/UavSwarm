@@ -2,3 +2,9 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
+
+from UavSwarm.tasks.direct.fulltask_swarm_rm.agents.skrl_shared_model import (
+    SharedPolicyModel,
+    CentralizedCriticModel,
+    AdaptiveCentralizedCriticModel,
+)

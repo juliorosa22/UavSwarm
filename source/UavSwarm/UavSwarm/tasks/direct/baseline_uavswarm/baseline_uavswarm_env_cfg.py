@@ -178,9 +178,9 @@ class SwarmParameterCfg:
     formation_apex_offset = 0.0          # Forward offset for apex drone
                        # Maximum mean distance (for large formations)
 
-
+##this baseline will only use stage 5 of the curriculum and wont extend RM states into observations yet.
 @configclass
-class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
+class BaselineUAVSwarmEnvCfg(DirectMARLEnvCfg):
     """
     Direct MARL workflow for UAV Swarm with multiple Crazyflies per environment.
     """
@@ -200,7 +200,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     
     #------ENV Spaces dimensions
     # 12 base + 1 obstacle distance + 3 neighbor relative velocity + 3 neighbor relative position + 4 RM state (one-hot) = 23
-    single_observation_space = 23  
+    single_observation_space = 19 #23 no RM states for baseline  
     # Policy- Action dimensions
     single_action_space = 4  # thrust + 3 moments per drone
     
@@ -210,7 +210,7 @@ class FullTaskUAVSwarmEnvCfg(DirectMARLEnvCfg):
     # Required for DirectMARLEnvCfg - using robot names as keys
     possible_agents = [f"robot_{i}" for i in range(num_agents)]
     action_spaces = {f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)}
-    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(23,)) for i in range(num_agents)}
+    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(19,)) for i in range(num_agents)}
    
     
     # ----- UI -----

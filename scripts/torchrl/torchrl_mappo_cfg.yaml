@@ -1,0 +1,74 @@
+seed: 42
+
+# Environment configuration
+env:
+  num_envs: 256
+  device: cuda:0
+  centralized_critic: true
+
+# Model architectures (adapted from skrl config but for TorchRL)
+models:
+  separate: true  # Separate policy per agent (MAPPO style)
+  
+  policy:
+    hidden_sizes: [256, 256, 128]  # Network architecture
+    activation: relu
+    clip_actions: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+  
+  critic:
+    hidden_sizes: [512, 512, 256]  # Larger critic for centralized training
+    activation: relu
+
+# MAPPO algorithm parameters (mapped to MAPPO class constructor)
+algorithm:
+  # Learning rates
+  learning_rate: 3.0e-4
+  
+  # Discount and GAE
+  gamma: 0.99                    # Discount factor
+  gae_lambda: 0.95               # GAE lambda for advantage estimation
+  
+  # PPO clipping
+  clip_epsilon: 0.2              # PPO clip ratio
+  
+  # Loss coefficients
+  value_loss_coef: 1.0           # c1: Value loss coefficient
+  entropy_coef: 0.01             # c2: Entropy bonus
+  
+  # Training parameters
+  n_epochs: 10                   # Number of PPO epochs per update
+  batch_size: 64                 # Mini-batch size for updates
+  frames_per_batch: 65536        # Rollout length: 256 envs × 256 steps = 65536
+  
+  # Gradient clipping (handled in MAPPO class)
+  max_grad_norm: 1.0
+  
+  # Preprocessing flags
+  normalize_observations: true
+  normalize_advantages: true
+  normalize_values: true
+  clip_observations: 10.0
+
+# Training configuration
+training:
+  total_frames: 10_000_000       # Total training frames (10M)
+  checkpoint_interval: 100       # Save checkpoint every N iterations
+  log_interval: 100              # Log metrics every N iterations
+  eval_interval: 5000            # Evaluate policy every N iterations (future use)
+  
+  # Directories (used by MAPPO class)
+  experiment_directory: "torchrl_runs"
+  experiment_name: "mappo_uav_swarm"
+
+# Preprocessing (for future implementation in MAPPO class)
+preprocessing:
+  state_preprocessor:
+    class: RunningStandardScaler
+    clip_threshold: 10.0
+  
+  value_preprocessor:
+    class: RunningStandardScaler
+    clip_threshold: 10.0

@@ -45,10 +45,10 @@ agent:
   mini_batches: 32  # ✅ Increased from 1 - more gradient updates per epoch
   discount_factor: 0.99
   lambda: 0.95  # GAE lambda for advantage estimation
-  learning_rate: 5.0e-05
+  learning_rate: 3.0e-04
   learning_rate_scheduler: KLAdaptiveLR
   learning_rate_scheduler_kwargs:
-    kl_threshold: 0.008  # ✅ Slightly increased from 0.008 - allows larger policy updates
+    kl_threshold: 0.01  # ✅ Slightly increased from 0.008 - allows larger policy updates
   state_preprocessor: RunningStandardScaler
   state_preprocessor_kwargs: null
   shared_state_preprocessor: RunningStandardScaler  # ✅ Important for MARL coordination
@@ -71,15 +71,15 @@ agent:
   time_limit_bootstrap: False
   # logging and checkpoint
   experiment:
-    directory: "new_stage5_model_continue2"  # ✅ Updated directory name for curriculum learning
+    directory: "baseline_stage5_model"  # ✅ Updated directory name for curriculum learning
     experiment_name: ""
-    write_interval: 5000 #5000  # ✅ Changed from auto - log every 500 steps
-    checkpoint_interval: 5000  # ✅ Changed from auto - save every 5000 steps
+    write_interval: 50000 #5000  # ✅ Changed from auto - log every 500 steps
+    checkpoint_interval: 50000  # ✅ Changed from auto - save every 5000 steps
 
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 500000  # ✅ Increased from 30000 - curriculum learning needs more time
+  timesteps: 5000000  # ✅ Increased from 30000 - curriculum learning needs more time
   environment_info: log
